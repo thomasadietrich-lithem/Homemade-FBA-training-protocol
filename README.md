@@ -24,17 +24,17 @@ This version is intended for **personal training**, with a simplified setup that
 
 ## 🧩 Files in This Repository
 
+cb_fba_training_psychopy.py = Main training script – "global tilt" version
 
-cb_fba_training_psychopy.py        # Main training script – "global tilt" version
-cb_fba_training_psychopy_DR.py     # Alternative version – "Direction Range enabled"
-analyse_fba_progress.py            # Script to visualize progress over sessions
+cb_fba_training_psychopy_DR.py = Alternative version – "Direction Range enabled"
+
+analyse_fba_progress.py = Script to visualize progress over sessions
+
 Two things are created automatically when you run the program:
 
 📁 1. /data/ folder (auto-created)
 Stores:
-
 trial-level .csv files
-
 session-level .json summaries
 
 📁 2. monitor_profiles.json (auto-created)
