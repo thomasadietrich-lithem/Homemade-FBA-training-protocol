@@ -1,19 +1,20 @@
 #!/usr/bin/env python
 # analyse_fba_progress.py
 #
-# Analysis script for FBA (Feature-Based Attention) training sessions
-# using summary JSON files produced by:
+# Dashboard analysis for FBA (Feature-Based Attention) training sessions.
+#
+# Reads all *_summary.json files from ./data (produced by:
 #   - cb_fba_training_psychopy.py
-#   - cb_fba_training_psychopy_DR.py
+#   - cb_fba_training_psychopy_DR.py)
 #
-# This script generates figures similar to those seen in the
-# University of Rochester / Huxlin Lab publications:
-#   - Direction threshold (deg) over training sessions
-#   - Accuracy (%) over training sessions
+# Builds a single "dashboard" figure:
+#   - Left column  : direction threshold (deg) over sessions
+#   - Right column : accuracy (%) over sessions
+#   - One row per experimental condition:
+#         (task, H_deg, V_internal, angle_set)
 #
-# It also groups sessions by condition:
-#   (task, H_deg, V_internal, angle_set)
-# so you can train at multiple visual field locations independently.
+# This is meant to resemble the way progress is visualized in
+# Huxlin Lab publications: threshold curves + performance curves.
 
 import os
 import json
@@ -65,18 +66,19 @@ def parse_timestamp(js):
 def group_by_condition(summaries):
     """
     Group sessions by experimental condition:
-        (task, H_deg, V_internal, angle_set)
-    This allows separate curves for different visual-field positions.
+        key = (task, H_deg, V_internal, angle_set)
+    This allows separate lines in the dashboard for different
+    stimulus locations or task variants.
     """
     groups = {}
     for js in summaries:
         task = js.get("task", "UNKNOWN")
         loc = js.get("location_deg_internal", {})
-        H = loc.get("H", None)
-        Vint = loc.get("V_internal", None)
+        H_deg = loc.get("H", None)
+        V_internal = loc.get("V_internal", None)
         angle_set = js.get("angle_set", None)
 
-        key = (task, H, Vint, angle_set)
+        key = (task, H_deg, V_internal, angle_set)
         groups.setdefault(key, []).append(js)
 
     return groups
@@ -89,7 +91,7 @@ def sort_sessions(sessions):
         if ts is not None:
             return ts
 
-        # fallback: use file modification date
+        # Fallback: use file modification date
         fname = js.get("_filename", "")
         full = os.path.join(DATA_DIR, fname)
         try:
@@ -101,67 +103,89 @@ def sort_sessions(sessions):
     return sorted(sessions, key=sort_key)
 
 
-def plot_condition(key, sessions_sorted):
+def build_dashboard(groups):
     """
-    Create threshold and accuracy plots for one experimental condition.
-    key = (task, H_deg, V_internal, angle_set)
+    Build a single dashboard figure:
+      - one row per condition
+      - left: threshold vs session
+      - right: accuracy vs session
     """
-    task, H_deg, V_internal, angle_set = key
-    V_field = -V_internal if V_internal is not None else None  # field convention
+    n_cond = len(groups)
+    if n_cond == 0:
+        print("No conditions to display.")
+        return
 
-    thresholds = []
-    accuracies = []
-    labels = []
-
-    for js in sessions_sorted:
-        thr = js.get("final_threshold_deg", None)
-        acc = js.get("accuracy_percent", None)
-        ts = parse_timestamp(js)
-
-        label = ts.strftime("%m-%d") if ts is not None else "?"
-        thresholds.append(thr)
-        accuracies.append(acc)
-        labels.append(label)
-
-    x = list(range(1, len(sessions_sorted) + 1))
-
-    # --- Figure 1: Direction threshold ---
-    plt.figure()
-    plt.plot(x, thresholds, marker="o")
-    plt.xlabel("Session")
-    plt.ylabel("Direction threshold (deg)")
-    title = (
-        f"FBA training – Direction threshold\n"
-        f"Task={task}, H={H_deg}°, V={V_field}°, angle_set={angle_set}"
+    # Prepare figure and axes grid
+    fig, axes = plt.subplots(
+        nrows=n_cond,
+        ncols=2,
+        figsize=(10, 4 * n_cond),
+        sharex="col"
     )
-    plt.title(title)
-    plt.grid(True, linestyle="--", alpha=0.3)
-    plt.xticks(x, labels, rotation=45)
 
-    # --- Figure 2: Accuracy ---
-    plt.figure()
-    plt.plot(x, accuracies, marker="o")
-    plt.xlabel("Session")
-    plt.ylabel("Accuracy (%)")
-    title2 = (
-        f"FBA training – Accuracy\n"
-        f"Task={task}, H={H_deg}°, V={V_field}°, angle_set={angle_set}"
-    )
-    plt.title(title2)
-    plt.grid(True, linestyle="--", alpha=0.3)
-    plt.xticks(x, labels, rotation=45)
+    # If only one condition, axes is 1D; make access uniform
+    if n_cond == 1:
+        axes = [axes]
 
-    # Print a summary block in console
-    print("\n==============================")
-    print("Condition:", key)
-    print(f"  Number of sessions : {len(sessions_sorted)}")
-    print(f"  Threshold (start)  : {thresholds[0]}")
-    print(f"  Threshold (last)   : {thresholds[-1]}")
-    print(f"  Accuracy  (start)  : {accuracies[0]}")
-    print(f"  Accuracy  (last)   : {accuracies[-1]}")
-    print("  Files in order:")
-    for js in sessions_sorted:
-        print("   -", js.get("_filename", "?"))
+    fig.suptitle("FBA training dashboard", fontsize=14)
+
+    # Iterate over each condition and plot
+    for row_idx, (key, sessions) in enumerate(sorted(groups.items(), key=lambda x: x[0])):
+        task, H_deg, V_internal, angle_set = key
+        V_field = -V_internal if V_internal is not None else None
+
+        sess_sorted = sort_sessions(sessions)
+
+        thresholds = []
+        accuracies = []
+        labels = []
+
+        for js in sess_sorted:
+            thr = js.get("final_threshold_deg", None)
+            acc = js.get("accuracy_percent", None)
+            ts = parse_timestamp(js)
+            label = ts.strftime("%m-%d") if ts is not None else "?"
+            thresholds.append(thr)
+            accuracies.append(acc)
+            labels.append(label)
+
+        x = list(range(1, len(sess_sorted) + 1))
+
+        # Left column: threshold
+        ax_thr = axes[row_idx][0]
+        ax_thr.plot(x, thresholds, marker="o")
+        ax_thr.set_ylabel("Threshold (deg)")
+        cond_label = f"{task}, H={H_deg}°, V={V_field}°, angle_set={angle_set}"
+        ax_thr.set_title(cond_label, fontsize=9)
+        ax_thr.grid(True, linestyle="--", alpha=0.3)
+        ax_thr.set_xticks(x)
+        ax_thr.set_xticklabels(labels, rotation=45)
+
+        # Right column: accuracy
+        ax_acc = axes[row_idx][1]
+        ax_acc.plot(x, accuracies, marker="o")
+        ax_acc.set_ylabel("Accuracy (%)")
+        ax_acc.set_title(cond_label, fontsize=9)
+        ax_acc.grid(True, linestyle="--", alpha=0.3)
+        ax_acc.set_xticks(x)
+        ax_acc.set_xticklabels(labels, rotation=45)
+
+        # Console summary for this condition
+        print("\n==============================")
+        print("Condition:", cond_label)
+        print(f"  Number of sessions : {len(sess_sorted)}")
+        print(f"  Threshold (start)  : {thresholds[0]}")
+        print(f"  Threshold (last)   : {thresholds[-1]}")
+        print(f"  Accuracy  (start)  : {accuracies[0]}")
+        print(f"  Accuracy  (last)   : {accuracies[-1]}")
+        print("  Files in order:")
+        for js in sess_sorted:
+            print("   -", js.get("_filename", "?"))
+
+    # Common x-label at the bottom
+    fig.text(0.5, 0.04, "Session (date)", ha="center")
+    plt.tight_layout(rect=[0.02, 0.05, 0.98, 0.95])
+    plt.show()
 
 
 def main():
@@ -170,13 +194,7 @@ def main():
         return
 
     groups = group_by_condition(summaries)
-
-    for key, sess in groups.items():
-        sess_sorted = sort_sessions(sess)
-        plot_condition(key, sess_sorted)
-
-    plt.tight_layout()
-    plt.show()
+    build_dashboard(groups)
 
 
 if __name__ == "__main__":
