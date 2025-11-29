@@ -8,20 +8,26 @@
 #   - cb_fba_training_psychopy_DR.py)
 #
 # Builds a single "dashboard" figure:
-#   - Left column  : direction threshold (deg) over sessions
+#   - Left  column : direction threshold (deg) over sessions
 #   - Right column : accuracy (%) over sessions
 #   - One row per experimental condition:
 #         (task, H_deg, V_internal, angle_set)
 #
-# This is meant to resemble the way progress is visualized in
-# Huxlin Lab publications: threshold curves + performance curves.
+# Extra features to help decision-making:
+#   - 3-session moving average (threshold & accuracy)
+#   - Linear regression line with slope and R²
+#   - Text summary of trends, including recent slope
+#   - Dashboard exported as PNG in ./analysis_outputs/
 
 import os
 import json
 import datetime as dt
+
+import numpy as np
 import matplotlib.pyplot as plt
 
 DATA_DIR = "data"
+OUTPUT_DIR = "analysis_outputs"
 
 
 def load_summaries(data_dir=DATA_DIR):
@@ -103,33 +109,80 @@ def sort_sessions(sessions):
     return sorted(sessions, key=sort_key)
 
 
+def moving_average(values, window=3):
+    """Compute simple moving average. Returns (x_indices, ma_values) or (None, None)."""
+    v = np.array(values, dtype=float)
+    if len(v) < window:
+        return None, None
+    ma = np.convolve(v, np.ones(window) / window, mode="valid")
+    x = np.arange(window, len(v) + 1)
+    return x, ma
+
+
+def linear_regression(x, y):
+    """
+    Simple linear regression y = a*x + b.
+    Returns slope a, intercept b, R^2.
+    If fewer than 2 points or NaN, returns (None, None, None).
+    """
+    x = np.array(x, dtype=float)
+    y = np.array(y, dtype=float)
+    mask = ~np.isnan(x) & ~np.isnan(y)
+    if mask.sum() < 2:
+        return None, None, None
+
+    x_m = x[mask]
+    y_m = y[mask]
+    a, b = np.polyfit(x_m, y_m, 1)
+    y_pred = a * x_m + b
+    ss_res = np.sum((y_m - y_pred) ** 2)
+    ss_tot = np.sum((y_m - np.mean(y_m)) ** 2)
+    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else None
+    return a, b, r2
+
+
+def trend_last_segment(values, last_n=5):
+    """
+    Compute simple slope over the last N sessions:
+    (last - first) / (N-1). Returns (slope, n_used).
+    """
+    v = np.array(values, dtype=float)
+    n = len(v)
+    if n < 2:
+        return None, n
+    n_seg = min(last_n, n)
+    first = v[-n_seg]
+    last = v[-1]
+    slope = (last - first) / (n_seg - 1) if n_seg > 1 else None
+    return slope, n_seg
+
+
 def build_dashboard(groups):
     """
     Build a single dashboard figure:
       - one row per condition
-      - left: threshold vs session
+      - left : threshold vs session
       - right: accuracy vs session
+      - raw data + moving average + regression line
+    Also prints text summary for each condition and saves the figure.
     """
     n_cond = len(groups)
     if n_cond == 0:
         print("No conditions to display.")
         return
 
-    # Prepare figure and axes grid
     fig, axes = plt.subplots(
         nrows=n_cond,
         ncols=2,
-        figsize=(10, 4 * n_cond),
+        figsize=(12, 4 * n_cond),
         sharex="col"
     )
 
-    # If only one condition, axes is 1D; make access uniform
     if n_cond == 1:
         axes = [axes]
 
     fig.suptitle("FBA training dashboard", fontsize=14)
 
-    # Iterate over each condition and plot
     for row_idx, (key, sessions) in enumerate(sorted(groups.items(), key=lambda x: x[0])):
         task, H_deg, V_internal, angle_set = key
         V_field = -V_internal if V_internal is not None else None
@@ -149,42 +202,122 @@ def build_dashboard(groups):
             accuracies.append(acc)
             labels.append(label)
 
-        x = list(range(1, len(sess_sorted) + 1))
+        x = np.arange(1, len(sess_sorted) + 1)
 
-        # Left column: threshold
-        ax_thr = axes[row_idx][0]
-        ax_thr.plot(x, thresholds, marker="o")
-        ax_thr.set_ylabel("Threshold (deg)")
         cond_label = f"{task}, H={H_deg}°, V={V_field}°, angle_set={angle_set}"
+
+        # --- Left column: threshold ---
+        ax_thr = axes[row_idx][0]
+        ax_thr.plot(x, thresholds, marker="o", label="Threshold")
+        ax_thr.set_ylabel("Threshold (deg)")
         ax_thr.set_title(cond_label, fontsize=9)
         ax_thr.grid(True, linestyle="--", alpha=0.3)
         ax_thr.set_xticks(x)
         ax_thr.set_xticklabels(labels, rotation=45)
 
-        # Right column: accuracy
+        # Moving average (threshold)
+        x_ma_thr, ma_thr = moving_average(thresholds, window=3)
+        if x_ma_thr is not None:
+            ax_thr.plot(x_ma_thr, ma_thr, linestyle="--", label="3-session MA")
+
+        # Regression (threshold)
+        slope_thr, intercept_thr, r2_thr = linear_regression(x, thresholds)
+        if slope_thr is not None:
+            y_pred_thr = slope_thr * x + intercept_thr
+            ax_thr.plot(x, y_pred_thr, alpha=0.6, label=f"Linear fit (slope={slope_thr:.2f})")
+
+        ax_thr.legend(fontsize=8)
+
+        # --- Right column: accuracy ---
         ax_acc = axes[row_idx][1]
-        ax_acc.plot(x, accuracies, marker="o")
+        ax_acc.plot(x, accuracies, marker="o", label="Accuracy")
         ax_acc.set_ylabel("Accuracy (%)")
         ax_acc.set_title(cond_label, fontsize=9)
         ax_acc.grid(True, linestyle="--", alpha=0.3)
         ax_acc.set_xticks(x)
         ax_acc.set_xticklabels(labels, rotation=45)
 
-        # Console summary for this condition
+        # Moving average (accuracy)
+        x_ma_acc, ma_acc = moving_average(accuracies, window=3)
+        if x_ma_acc is not None:
+            ax_acc.plot(x_ma_acc, ma_acc, linestyle="--", label="3-session MA")
+
+        # Regression (accuracy)
+        slope_acc, intercept_acc, r2_acc = linear_regression(x, accuracies)
+        if slope_acc is not None:
+            y_pred_acc = slope_acc * x + intercept_acc
+            ax_acc.plot(x, y_pred_acc, alpha=0.6, label=f"Linear fit (slope={slope_acc:.2f})")
+
+        ax_acc.legend(fontsize=8)
+
+        # ---- Console summary for this condition ----
         print("\n==============================")
         print("Condition:", cond_label)
-        print(f"  Number of sessions : {len(sess_sorted)}")
-        print(f"  Threshold (start)  : {thresholds[0]}")
-        print(f"  Threshold (last)   : {thresholds[-1]}")
-        print(f"  Accuracy  (start)  : {accuracies[0]}")
-        print(f"  Accuracy  (last)   : {accuracies[-1]}")
-        print("  Files in order:")
+        print(f"  Number of sessions        : {len(sess_sorted)}")
+        print(f"  Threshold (start / last)  : {thresholds[0]}  / {thresholds[-1]}")
+        print(f"  Accuracy  (start / last)  : {accuracies[0]}  / {accuracies[-1]}")
+
+        # Prepare R² strings safely
+        if slope_thr is not None:
+            if r2_thr is not None:
+                r2_thr_str = f"{r2_thr:.3f}"
+            else:
+                r2_thr_str = "n/a"
+            print(
+                f"  Threshold linear slope     : {slope_thr:.3f} deg/session "
+                f"(R^2={r2_thr_str})"
+            )
+
+        if slope_acc is not None:
+            if r2_acc is not None:
+                r2_acc_str = f"{r2_acc:.3f}"
+            else:
+                r2_acc_str = "n/a"
+            print(
+                f"  Accuracy  linear slope     : {slope_acc:.3f} %/session "
+                f"(R^2={r2_acc_str})"
+            )
+
+        # Recent trend (last N sessions)
+        thr_recent_slope, n_thr_seg = trend_last_segment(thresholds, last_n=5)
+        acc_recent_slope, n_acc_seg = trend_last_segment(accuracies, last_n=5)
+
+        if thr_recent_slope is not None:
+            print(
+                f"  Recent threshold trend     : {thr_recent_slope:.3f} deg/session "
+                f"(over last {n_thr_seg} sessions)"
+            )
+        if acc_recent_slope is not None:
+            print(
+                f"  Recent accuracy trend      : {acc_recent_slope:.3f} %/session "
+                f"(over last {n_acc_seg} sessions)"
+            )
+
+        # Simple qualitative suggestion (very rough heuristic)
+        if thr_recent_slope is not None:
+            if abs(thr_recent_slope) < 1.0 and len(sess_sorted) >= 10:
+                print("  NOTE: Threshold trend is flat (<1 deg/session) over the last sessions.")
+                print("        If threshold remains high, this may be a point to consider "
+                      "changing the stimulus location.")
+            elif thr_recent_slope < -1.0:
+                print("  NOTE: Threshold is still clearly improving (decreasing).")
+            elif thr_recent_slope > 1.0:
+                print("  NOTE: Threshold is increasing; consider checking fatigue or setup.")
+
+        print("  Files in chronological order:")
         for js in sess_sorted:
             print("   -", js.get("_filename", "?"))
 
     # Common x-label at the bottom
     fig.text(0.5, 0.04, "Session (date)", ha="center")
     plt.tight_layout(rect=[0.02, 0.05, 0.98, 0.95])
+
+    # Save figure to disk
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    out_path = os.path.join(OUTPUT_DIR, "fba_dashboard.png")
+    fig.savefig(out_path, dpi=150)
+    print(f"\nDashboard figure saved to: {out_path}")
+
     plt.show()
 
 
