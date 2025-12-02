@@ -150,7 +150,8 @@ This is the same convention used in the original Matlab code.
 
 ---
 
-Monitor calibration
+## Monitor calibration
+
 Because the task is highly sensitive to spatial geometry, the script includes a basic calibration step.
 On first run with a given monitor, the script asks for:
 - physical screen width (cm)
@@ -165,7 +166,7 @@ This is important if training is performed on different computers or screens.
 
 ---
 
-Analytics and dashboard
+## Analytics and dashboard
 The file analyse_fba_progress.py reads all *_summary.json files in the data/ directory and builds an analysis dashboard.
 
 For each condition (defined by the combination of task, H_deg, V_internal and angle_set), it shows:
@@ -214,7 +215,10 @@ To analyse your progress:
 python analyse_fba_progress.py
 This will read all existing summary files and update the dashboard.
 
-Acknowledgement and disclaimer
+---
+
+## Acknowledgement and disclaimer
+
 This project is a Python/PsychoPy reinterpretation of the structure and logic of the original FBA training tools shared by the Huxlin Lab (University of Rochester):
 https://github.com/huxlinlab
 It is not an official clinical tool and should not be used as a substitute for medical advice or supervised rehabilitation. Any use for self-training should be discussed with a qualified clinician.
