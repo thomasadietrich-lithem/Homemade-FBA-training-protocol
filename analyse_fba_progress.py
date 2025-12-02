@@ -3,21 +3,20 @@
 #
 # Dashboard analysis for FBA (Feature-Based Attention) training sessions.
 #
-# Reads all *_summary.json files from ./data (produced by:
+# Reads all *_summary.json files from ./data produced by:
 #   - cb_fba_training_psychopy.py
-#   - cb_fba_training_psychopy_DR.py)
+#   - cb_fba_training_psychopy_DR.py
 #
 # Builds a single "dashboard" figure:
-#   - Left  column : direction threshold (deg) over sessions
+#   - One row per experimental condition: (task, H_deg, V_internal, angle_set)
+#   - Left  column : direction-range threshold (deg) over sessions
+#                   (mean threshold + the 3 individual staircases)
 #   - Right column : accuracy (%) over sessions
-#   - One row per experimental condition:
-#         (task, H_deg, V_internal, angle_set)
-#
-# Extra features to help decision-making:
-#   - 3-session moving average (threshold & accuracy)
-#   - Linear regression line with slope and R²
-#   - Text summary of trends, including recent slope
-#   - Dashboard exported as PNG in ./analysis_outputs/
+#   - Adds:
+#       - 3-session moving average (mean threshold and accuracy)
+#       - Linear regression lines (slope + R² printed to console)
+#       - Recent trend over the last sessions (for plateau detection)
+#   - Saves the dashboard as PNG in ./analysis_outputs/
 
 import os
 import json
@@ -161,7 +160,7 @@ def build_dashboard(groups):
     """
     Build a single dashboard figure:
       - one row per condition
-      - left : threshold vs session
+      - left : threshold vs session (mean + 3 staircases)
       - right: accuracy vs session
       - raw data + moving average + regression line
     Also prints text summary for each condition and saves the figure.
@@ -189,44 +188,79 @@ def build_dashboard(groups):
 
         sess_sorted = sort_sessions(sessions)
 
-        thresholds = []
+        thresholds_mean = []
+        thresholds_s1 = []
+        thresholds_s2 = []
+        thresholds_s3 = []
         accuracies = []
         labels = []
 
         for js in sess_sorted:
-            thr = js.get("final_threshold_deg", None)
+            # accuracy
             acc = js.get("accuracy_percent", None)
+            accuracies.append(acc)
+
+            # label from timestamp
             ts = parse_timestamp(js)
             label = ts.strftime("%m-%d") if ts is not None else "?"
-            thresholds.append(thr)
-            accuracies.append(acc)
             labels.append(label)
 
-        x = np.arange(1, len(sess_sorted) + 1)
+            # staircase details
+            angle_range = js.get("angle_range", [])
+            stairs = js.get("stair_levels", {})
+            s1_idx = stairs.get("stair1", None)
+            s2_idx = stairs.get("stair2", None)
+            s3_idx = stairs.get("stair3", None)
 
+            def idx_to_deg(idx):
+                if idx is None or idx < 1 or idx > len(angle_range):
+                    return np.nan
+                return float(angle_range[idx - 1])
+
+            thr1 = idx_to_deg(s1_idx)
+            thr2 = idx_to_deg(s2_idx)
+            thr3 = idx_to_deg(s3_idx)
+
+            thresholds_s1.append(thr1)
+            thresholds_s2.append(thr2)
+            thresholds_s3.append(thr3)
+
+            # mean threshold (Rochester convention)
+            thr_mean = np.nanmean([thr1, thr2, thr3])
+            thresholds_mean.append(thr_mean)
+
+        x = np.arange(1, len(sess_sorted) + 1)
         cond_label = f"{task}, H={H_deg}°, V={V_field}°, angle_set={angle_set}"
 
         # --- Left column: threshold ---
         ax_thr = axes[row_idx][0]
-        ax_thr.plot(x, thresholds, marker="o", label="Threshold")
+
+        # three staircases (thin dotted lines)
+        ax_thr.plot(x, thresholds_s1, marker="o", linestyle=":", alpha=0.5, label="Staircase 1")
+        ax_thr.plot(x, thresholds_s2, marker="o", linestyle=":", alpha=0.5, label="Staircase 2")
+        ax_thr.plot(x, thresholds_s3, marker="o", linestyle=":", alpha=0.5, label="Staircase 3")
+
+        # mean threshold (thicker)
+        ax_thr.plot(x, thresholds_mean, marker="o", linewidth=2, label="Mean threshold")
+
         ax_thr.set_ylabel("Threshold (deg)")
         ax_thr.set_title(cond_label, fontsize=9)
         ax_thr.grid(True, linestyle="--", alpha=0.3)
         ax_thr.set_xticks(x)
         ax_thr.set_xticklabels(labels, rotation=45)
 
-        # Moving average (threshold)
-        x_ma_thr, ma_thr = moving_average(thresholds, window=3)
+        # Moving average (mean threshold)
+        x_ma_thr, ma_thr = moving_average(thresholds_mean, window=3)
         if x_ma_thr is not None:
-            ax_thr.plot(x_ma_thr, ma_thr, linestyle="--", label="3-session MA")
+            ax_thr.plot(x_ma_thr, ma_thr, linestyle="--", label="3-session MA (mean)")
 
-        # Regression (threshold)
-        slope_thr, intercept_thr, r2_thr = linear_regression(x, thresholds)
+        # Regression (mean threshold)
+        slope_thr, intercept_thr, r2_thr = linear_regression(x, thresholds_mean)
         if slope_thr is not None:
             y_pred_thr = slope_thr * x + intercept_thr
             ax_thr.plot(x, y_pred_thr, alpha=0.6, label=f"Linear fit (slope={slope_thr:.2f})")
 
-        ax_thr.legend(fontsize=8)
+        ax_thr.legend(fontsize=7)
 
         # --- Right column: accuracy ---
         ax_acc = axes[row_idx][1]
@@ -248,14 +282,17 @@ def build_dashboard(groups):
             y_pred_acc = slope_acc * x + intercept_acc
             ax_acc.plot(x, y_pred_acc, alpha=0.6, label=f"Linear fit (slope={slope_acc:.2f})")
 
-        ax_acc.legend(fontsize=8)
+        ax_acc.legend(fontsize=7)
 
-        # ---- Console summary for this condition ----
+        # ---- Console summary ----
         print("\n==============================")
         print("Condition:", cond_label)
         print(f"  Number of sessions        : {len(sess_sorted)}")
-        print(f"  Threshold (start / last)  : {thresholds[0]}  / {thresholds[-1]}")
-        print(f"  Accuracy  (start / last)  : {accuracies[0]}  / {accuracies[-1]}")
+        print(f"  Mean threshold start/last : {thresholds_mean[0]} / {thresholds_mean[-1]}")
+        print(f"  Stair1 thresholds         : {thresholds_s1}")
+        print(f"  Stair2 thresholds         : {thresholds_s2}")
+        print(f"  Stair3 thresholds         : {thresholds_s3}")
+        print(f"  Accuracy start/last       : {accuracies[0]} / {accuracies[-1]}")
 
         # Prepare R² strings safely
         if slope_thr is not None:
@@ -278,8 +315,8 @@ def build_dashboard(groups):
                 f"(R^2={r2_acc_str})"
             )
 
-        # Recent trend (last N sessions)
-        thr_recent_slope, n_thr_seg = trend_last_segment(thresholds, last_n=5)
+        # Recent trend (last N sessions) on mean threshold and accuracy
+        thr_recent_slope, n_thr_seg = trend_last_segment(thresholds_mean, last_n=5)
         acc_recent_slope, n_acc_seg = trend_last_segment(accuracies, last_n=5)
 
         if thr_recent_slope is not None:
@@ -293,12 +330,12 @@ def build_dashboard(groups):
                 f"(over last {n_acc_seg} sessions)"
             )
 
-        # Simple qualitative suggestion (very rough heuristic)
+        # Simple qualitative heuristic for decision-making
         if thr_recent_slope is not None:
             if abs(thr_recent_slope) < 1.0 and len(sess_sorted) >= 10:
                 print("  NOTE: Threshold trend is flat (<1 deg/session) over the last sessions.")
-                print("        If threshold remains high, this may be a point to consider "
-                      "changing the stimulus location.")
+                print("        If the mean threshold remains high, this may be a point to consider")
+                print("        changing or slightly shifting the stimulus location.")
             elif thr_recent_slope < -1.0:
                 print("  NOTE: Threshold is still clearly improving (decreasing).")
             elif thr_recent_slope > 1.0:
