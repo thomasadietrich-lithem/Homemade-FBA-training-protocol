@@ -1,206 +1,229 @@
-# 🧠 FBA RDK Training — PsychoPy Implementation
+# FBA RDK Training — PsychoPy Implementation
 
-A Python/PsychoPy reconstruction of the University of Rochester’s Feature-Based Attention (FBA) visual motion training task.
+A Python/PsychoPy reconstruction of the University of Rochester’s Feature-Based Attention (FBA) direction-range visual training task used in visual rehabilitation after occipital stroke.
+
+This implementation was reverse-engineered from the Matlab + Psychtoolbox code shared by the Huxlin Lab (University of Rochester), with the aim of preserving:
+
+- stimulus geometry
+- staircase dynamics
+- dot motion parameters
+- timing
+- eccentricity mapping
+- response rules
+- auditory feedback
+
+It is intended for personal training and experimentation. It does not depend on Matlab, Psychtoolbox, AWS, or any cloud infrastructure.
 
 ---
 
-## 📌 Overview
+## Files in this repository
 
-This repository contains a working PsychoPy implementation of an FBA Random-Dot Kinematogram (RDK) training task used in visual rehabilitation protocols from the Huxlin Lab (University of Rochester).
+- `cb_fba_training_psychopy.py`  
+  Main training script implementing the FBA direction‐range RDK task.
 
-It was recreated by reverse-engineering Matlab + Psychtoolbox code made publicly available in their GitHub repository, with the goal of preserving the logic of:
+- `cb_fba_training_psychopy_DR.py`  
+  Alternative version explicitly configured for direction‐range training (10% signal dots, 90% noise).
 
-- stimulus geometry  
-- staircase dynamics  
-- dot motion parameters  
-- timing  
-- eccentricity mapping  
-- response rules  
-- auditory feedback  
+- `analyse_fba_progress.py`  
+  Analysis script that reads session summary JSON files and produces a dashboard showing threshold and accuracy over sessions, including the three staircases.
 
-This version is intended for **personal training**, with a simplified setup that does not depend on Matlab, Psychtoolbox, or cloud infrastructure.
+Two additional things are created automatically when you run the program:
 
+1. `data/` directory  
+   Contains:
+   - trial-level `.csv` logs  
+   - session-level `*_summary.json` files (one per training session)
 
-
-## 🧩 Files in This Repository
-
-cb_fba_training_psychopy.py = Main training script – "global tilt" version
-
-cb_fba_training_psychopy_DR.py = Alternative version – "Direction Range enabled"
-
-analyse_fba_progress.py = Script to visualize progress over sessions
-
-Two things are created automatically when you run the program:
-
-📁 1. /data/ folder (auto-created)
-Stores:
-trial-level .csv files
-session-level .json summaries
-
-📁 2. monitor_profiles.json (auto-created)
-Stores per-monitor screen calibration so that stimulus geometry and eccentricity remain correct when switching displays.
+2. `monitor_profiles.json`  
+   Stores monitor calibration so that stimulus geometry remains consistent across different screens.
 
 You do not need to create these manually.
 
-🔧 Requirements
-Python 3.10 → 3.12
-PsychoPy 2024.2+
-numpy
-Standard Python libs: json, csv, time, os
+---
 
-Download PsychoPy:
-https://www.psychopy.org/download.html
+## Requirements
 
-🎯 Scientific Fidelity — What Has Been Reproduced
-The following elements match the logic and parameter ranges found in the Rochester Matlab code and related publications:
+- Python 3.10 – 3.12
+- Dependencies:
+  - PsychoPy 2024.2 or later
+  - numpy
+  - matplotlib (for analysis script)
+  - json, csv, time, os (standard library)
 
-✔ Stimulus parameters
-RDK with motion direction discrimination around a main axis
-Dot density: 3.5 dots/deg²
-Dot size: 14 arcmin (converted to pixels based on calibration)
-Dot lifetime: 200 ms
-Dot speed: 10 deg/s
-Circular aperture: 2.5° radius
-Stimulus duration: 500 m
-Background: mid-gray
+PsychoPy can be downloaded from:
 
-✔ Staircase system
-3 interleaved staircases
+- https://www.psychopy.org/download.html
 
-Angle ranges identical to the Matlab set:
+---
+
+## Scientific fidelity – what is reproduced
+
+The implementation aims to follow as closely as possible the behaviour of the Rochester Matlab + Psychtoolbox version:
+
+- Random-dot kinematogram (RDK) with direction-range discrimination
+- Three interleaved staircases with a 3-up / 1-down rule
+- Same direction-range values as the Matlab code
+- Same mapping between eccentricity (H, V in degrees) and pixels
+- Same response rules (UP/DOWN vs LEFT/RIGHT depending on axis)
+- Same structure for trial timing and feedback tones
+
+This is not an official tool from the Huxlin Lab, but a reinterpretation based on their shared code and publications. Feedback from the original authors is very welcome.
+
+---
+
+## Direction-range RDK configuration
+
+This PsychoPy implementation reproduces the direction-range (DR) version of the random-dot kinematogram task used in the Huxlin Lab FBA training studies.
+
+Stimulus type:
+
+- Circular random-dot kinematogram (RDK)
+- Aperture radius: 2.5° visual angle
+- Dot density: 3.5 dots/deg²
+- Dot size: 14 arcmin (converted to pixels using monitor calibration)
+- Dot speed: 10 deg/s
+- Dot lifetime: 200 ms
+- Stimulus duration: 500 ms
+- Background: mid-gray
+
+Direction-range logic and feature-based attention:
+
+- On each trial, 10% of the dots move coherently in a direction that is slightly tilted upward or downward (for `angle_set = 0`) around the horizontal axis.
+- The remaining 90% of the dots move in random directions within a direction range centred on the main motion axis.
+- The direction range is expressed in degrees of spread around the axis (for example 85°, 53.1°, 33.2°, …, 0.5°).
+- Large direction ranges (for example 85°) mean that dot directions are highly dispersed: the global motion signal is very weak, and the task is difficult.
+- Small direction ranges (for example 2° or 0.5°) mean dot directions are tightly clustered: the global motion signal is strong, and the task is easier.
+- The subject’s task is not to follow the average horizontal motion, but to report whether the global motion is tilted slightly upward or slightly downward.
+
+Response mapping:
+
+- `angle_set = 0`  
+  Horizontal reference axis.  
+  Task: discriminate upward vs downward tilt.  
+  Response keys: Up and Down arrows.
+
+- `angle_set = 1`  
+  Vertical reference axis.  
+  Task: discriminate leftward vs rightward tilt.  
+  Response keys: Left and Right arrows.
+
+---
+
+## Staircase procedure
+
+To closely follow the Rochester Matlab implementation, three interleaved staircases are used.
+
+Direction-range levels (in degrees):
+
+
 angle_range = [85, 53.1, 33.2, 20.75, 12.97, 8.1, 5.1, 3.2, 2.0, 1.2, 0.8, 0.5]
-Staircase rule (per staircase):
-+1 level after 3 consecutive correct responses
-−1 level after a single incorrect response
+Initial staircase indices:
 
-✔ Fixation and pre-cue
-Dual-ring fixation dot (black outer ring + white inner dot)
-Pre-cue: a line from fixation to the stimulus location
+stair1 = 1 (hardest: 85°)
+stair2 = 4 (intermediate: 20.75°)
+stair3 = 8 (easier: 3.2°)
 
-✔ Response rules
-angle_set = 0 → training on a horizontal axis
-→ respond UP / DOWN depending on whether the global motion is tilted upward or downward
+Behaviour:
 
-angle_set = 1 → training on a vertical axis
-→ respond LEFT / RIGHT depending on whether the global motion is tilted leftward or rightward
+On each trial, one of the three staircases is selected at random.
 
-✔ Auditory feedback
-1000 Hz = trial start
-1200 Hz = correct response
-800 Hz = incorrect response
+The current staircase index determines the direction range for that trial:
+direction_range_deg = angle_range[stair_index - 1].
 
-🖥️ Monitor Calibration (Auto-Saved)
-Because this program may be used on different displays, a simple calibration system is included to keep geometry consistent.
+Each staircase follows a 3-up / 1-down rule:
 
-On first use with a new monitor, the script asks for:
-physical screen width (in centimeters)
-viewing distance (in centimeters)
-it also reads the current screen resolution in pixels
-From these values, it computes a conversion between:
-pixels ↔ degrees of visual angle
-pixels ↔ arcminutes
-using the same geometry as the original Matlab/Psychtoolbox code:
+after 3 consecutive correct responses in that staircase, its index is increased by 1 → task becomes more difficult (smaller direction range)
 
-theta = atan( (screen_width_cm / 2) / viewing_distance_cm )   # in radians
-theta_deg = theta * 180 / pi
-arcmin_per_pixel = theta_deg * 60 / (screen_width_in_pixels / 2)
+after 1 incorrect response in that staircase, its index is decreased by 1 → task becomes easier (larger direction range)
 
-deg_to_pix = (deg * 60) / arcmin_per_pixel
+Indices are clipped to remain in the range 1 … len(angle_range).
 
-This ensures that:
-stimulus eccentricity (H, V in degrees)
-dot size in arcmin
-aperture radius in degrees
-are consistent across sessions and monitors.
-Calibration is then saved into:
-monitor_profiles.json
-using a key like "OS:widthxheight" (e.g. "Windows:1920x1080"), and automatically reused the next time the script is run on that monitor.
+Session threshold:
 
-🔀 Two Variants of the Task (for Rochester’s Feedback)
-This repository currently provides two closely related variants of the training task, so that the Rochester team can confirm which one best matches their current clinical implementation.
+At the end of a session, the script converts the final staircase indices to degrees:
 
-1️⃣ cb_fba_training_psychopy.py — "Global Tilt" Version
-This version reproduces exactly the behavior observed in the Matlab file we had access to.
+thr1 = angle_range[stair1_index - 1]
 
-In that Matlab code, the per-dot direction was computed using a line of the form:
+thr2 = angle_range[stair2_index - 1]
 
-vectors = pi * (angle + normrnd(0, 0, ndots, 1)) / 180;
-Because the standard deviation of the Gaussian is set to 0 (normrnd(0, 0, ...)), all dots share exactly the same direction.
-The task therefore becomes a small global-tilt discrimination around the main axis (e.g. slightly above vs. slightly below the horizontal).
+thr3 = angle_range[stair3_index - 1]
 
-In other words:
-the staircase adjusts the tilt size around the axis
-but there is effectively no direction-range dispersion across dots in this particular Matlab file.
-This "global tilt" version is implemented in:
+The overall session direction-range threshold is then defined as:
 
-cb_fba_training_psychopy.py
-and is faithful to that specific Matlab behavior.
+final_threshold_deg = (thr1 + thr2 + thr3) / 3
+This is the same convention used in the original Matlab code.
 
-2️⃣ cb_fba_training_psychopy_DR.py — "Direction Range Enabled" Version
-This alternative version implements a true direction-range stimulus, closer to what is described in the Huxlin/Tadin publications and patent.
+Monitor calibration
+Because the task is highly sensitive to spatial geometry, the script includes a basic calibration step.
 
-Here:
-a central direction angle_deg is defined (corresponding to the main axis + tilt),
-and each dot’s direction is drawn from a Gaussian distribution around this central direction:
+On first run with a given monitor, the script asks for:
+physical screen width (cm)
+viewing distance (cm)
+screen resolution (pixels)
 
-noise_deg = np.random.normal(loc=0.0, scale=angle_deviationP, size=n_dots)
-dot_angles_deg = angle_deg + noise_deg
-when a dot’s lifetime expires and it is respawned, it is given a new random direction sampled from the same distribution.
+From these values it computes a conversion between degrees of visual angle (and arcminutes) and pixels, mimicking the logic in the Matlab/Psychtoolbox implementation.
 
-Thus, the direction range is controlled by the staircase variable angle_deviationP:
-large values (e.g. 85°) → wide dispersion of motion directions
-small values (e.g. 2°, 1°, 0.5°) → very subtle tilt around the axis
-This version is implemented in:
+The calibration is stored in:
+monitor_profiles.json and is automatically reused on subsequent runs with the same monitor.
+This is important if training is performed on different computers or screens.
 
-cb_fba_training_psychopy_DR.py
-and the session summary files are tagged with:
+Analytics and dashboard
+The file analyse_fba_progress.py reads all *_summary.json files in the data/ directory and builds an analysis dashboard.
 
-"task": "FBA_RDK_DirectionRange"
+For each condition (defined by the combination of task, H_deg, V_internal and angle_set), it shows:
 
+Left panel:
 
-📊 Analytics
-analyse_fba_progress.py generates progress graphs based on the .json summaries in /data.
+the three staircase thresholds across sessions (in degrees)
+the mean threshold across staircases (thicker line)
+a 3-session moving average of the mean threshold
+a linear regression line for the mean threshold, with slope printed in deg/session
 
-It displays:
-
-direction threshold progression over sessions (primary clinical metric)
+Right panel:
 accuracy (%) across sessions
-Usage:
+a 3-session moving average of accuracy
+a linear regression line for accuracy, with slope printed in %/session
+
+The script:
+
+groups sessions by condition (so different visual field locations appear as different rows)
+orders sessions chronologically by timestamp
+prints a text summary to the console, including:
+mean threshold start / last
+staircase thresholds for each session
+accuracy start / last
+linear slopes and R² for threshold and accuracy
+a simple “recent trend” over the last five sessions, to detect plateaus
+
+The dashboard figure is also saved as:
+analysis_outputs/fba_dashboard.png
+
+This is intended to approximate the kind of plots shown in the Huxlin Lab publications, and to help decide when a given training location has reached a plateau (for example when the mean threshold trend is flat over many sessions) and might be ready to shift further into the blind field.
+
+Running the training
+To run a training session:
+
+Double-click cb_fba_training_psychopy.py in PsychoPy
+or run:
+
+python cb_fba_training_psychopy.py
+You will be prompted for:
+
+angle_set (0 = horizontal axis / Up–Down, 1 = vertical axis / Left–Right)
+stimulus eccentricity in degrees (H and V)
+subject ID
+
+To analyse your progress:
 
 python analyse_fba_progress.py
-The script currently loads all *_FBA_*_summary.json files, so it will include both “global tilt” and “Direction Range” sessions unless further filtered.
+This will read all existing summary files and update the dashboard.
 
-▶️ Running the Training
-You can run either variant:
+Acknowledgement and disclaimer
+This project is a Python/PsychoPy reinterpretation of the structure and logic of the original FBA training tools shared by the Huxlin Lab (University of Rochester):
+https://github.com/huxlinlab
+It is not an official clinical tool and should not be used as a substitute for medical advice or supervised rehabilitation. Any use for self-training should be discussed with a qualified clinician.
 
-python cb_fba_training_psychopy.py        # Global tilt version
-python cb_fba_training_psychopy_DR.py     # Direction Range enabled version
-In both cases, you will be prompted for:
-
-angle set (0 = horizontal axis / UP–DOWN, 1 = vertical axis / LEFT–RIGHT)
-stimulus eccentricity in degrees (H, V, visual field convention)
-subject ID
-Then the training session begins.
-
-❗ Features Not Included (by Design)
-The original Matlab code (full clinical tool) contains:
-
-an automatic displacement mechanism to move the stimulus deeper into the blind field after stable performance,
-cloud/backend logic (AWS S3) for remote data upload.
-These have not been implemented here:
-stimulus location is chosen manually before each session,
-all data are stored locally.
-
-📬 Acknowledgement
-This work is a Python/PsychoPy reinterpretation of the structure of an FBA training tool shared by the Huxlin Lab (GitHub: https://github.com/huxlinlab).
-
-cb_fba_training_psychopy.py closely reproduces the behavior of the specific Matlab file we could inspect (with direction-range effectively disabled by normrnd(0, 0, ...)).
-cb_fba_training_psychopy_DR.py re-enables a true direction-range stimulus, inspired by their published descriptions.
-
-Feedback from the Rochester team is warmly welcomed, in particular regarding:
-
-which of these two variants best matches their current clinical implementation,
-and whether the calibration approach is sufficient for their standards.
+Feedback or corrections from the original authors, or from researchers familiar with the protocol, are very welcome.
 
 Contact:
-Thomas Dietrich — thomas.a.dietrich@gmail.com
+Thomas Dietrich – thomas.a.dietrich@gmail.com
