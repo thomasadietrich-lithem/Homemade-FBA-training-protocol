@@ -97,12 +97,12 @@ Direction-range logic and feature-based attention:
 
 Response mapping:
 
-- `angle_set = 0`  
+- angle_set = 0  
   Horizontal reference axis.  
   Task: discriminate upward vs downward tilt.  
   Response keys: Up and Down arrows.
 
-- `angle_set = 1`  
+- angle_set = 1  
   Vertical reference axis.  
   Task: discriminate leftward vs rightward tilt.  
   Response keys: Left and Right arrows.
@@ -123,6 +123,7 @@ stair1 = 1 (hardest: 85°)
 stair2 = 4 (intermediate: 20.75°)
 stair3 = 8 (easier: 3.2°)
 
+
 Behaviour:
 
 On each trial, one of the three staircases is selected at random.
@@ -131,11 +132,8 @@ The current staircase index determines the direction range for that trial:
 direction_range_deg = angle_range[stair_index - 1].
 
 Each staircase follows a 3-up / 1-down rule:
-
 after 3 consecutive correct responses in that staircase, its index is increased by 1 → task becomes more difficult (smaller direction range)
-
 after 1 incorrect response in that staircase, its index is decreased by 1 → task becomes easier (larger direction range)
-
 Indices are clipped to remain in the range 1 … len(angle_range).
 
 Session threshold:
@@ -143,23 +141,19 @@ Session threshold:
 At the end of a session, the script converts the final staircase indices to degrees:
 
 thr1 = angle_range[stair1_index - 1]
-
 thr2 = angle_range[stair2_index - 1]
-
 thr3 = angle_range[stair3_index - 1]
 
 The overall session direction-range threshold is then defined as:
-
 final_threshold_deg = (thr1 + thr2 + thr3) / 3
 This is the same convention used in the original Matlab code.
 
 Monitor calibration
 Because the task is highly sensitive to spatial geometry, the script includes a basic calibration step.
-
 On first run with a given monitor, the script asks for:
-physical screen width (cm)
-viewing distance (cm)
-screen resolution (pixels)
+- physical screen width (cm)
+- viewing distance (cm)
+- screen resolution (pixels)
 
 From these values it computes a conversion between degrees of visual angle (and arcminutes) and pixels, mimicking the logic in the Matlab/Psychtoolbox implementation.
 
@@ -173,27 +167,25 @@ The file analyse_fba_progress.py reads all *_summary.json files in the data/ dir
 For each condition (defined by the combination of task, H_deg, V_internal and angle_set), it shows:
 
 Left panel:
-
-the three staircase thresholds across sessions (in degrees)
-the mean threshold across staircases (thicker line)
-a 3-session moving average of the mean threshold
-a linear regression line for the mean threshold, with slope printed in deg/session
+- the three staircase thresholds across sessions (in degrees)
+- the mean threshold across staircases (thicker line)
+- a 3-session moving average of the mean threshold
+- a linear regression line for the mean threshold, with slope printed in deg/session
 
 Right panel:
-accuracy (%) across sessions
-a 3-session moving average of accuracy
-a linear regression line for accuracy, with slope printed in %/session
+- accuracy (%) across sessions
+- a 3-session moving average of accuracy
+- a linear regression line for accuracy, with slope printed in %/session
 
 The script:
-
-groups sessions by condition (so different visual field locations appear as different rows)
-orders sessions chronologically by timestamp
-prints a text summary to the console, including:
-mean threshold start / last
-staircase thresholds for each session
-accuracy start / last
-linear slopes and R² for threshold and accuracy
-a simple “recent trend” over the last five sessions, to detect plateaus
+- groups sessions by condition (so different visual field locations appear as different rows)
+- orders sessions chronologically by timestamp
+- prints a text summary to the console, including:
+- mean threshold start / last
+- staircase thresholds for each session
+- accuracy start / last
+- linear slopes and R² for threshold and accuracy
+- a simple “recent trend” over the last five sessions, to detect plateaus
 
 The dashboard figure is also saved as:
 analysis_outputs/fba_dashboard.png
