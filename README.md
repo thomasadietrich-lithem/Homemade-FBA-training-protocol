@@ -148,6 +148,8 @@ The overall session direction-range threshold is then defined as:
 final_threshold_deg = (thr1 + thr2 + thr3) / 3
 This is the same convention used in the original Matlab code.
 
+---
+
 Monitor calibration
 Because the task is highly sensitive to spatial geometry, the script includes a basic calibration step.
 On first run with a given monitor, the script asks for:
@@ -160,6 +162,8 @@ From these values it computes a conversion between degrees of visual angle (and 
 The calibration is stored in:
 monitor_profiles.json and is automatically reused on subsequent runs with the same monitor.
 This is important if training is performed on different computers or screens.
+
+---
 
 Analytics and dashboard
 The file analyse_fba_progress.py reads all *_summary.json files in the data/ directory and builds an analysis dashboard.
