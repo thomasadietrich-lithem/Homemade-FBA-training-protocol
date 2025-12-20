@@ -19,7 +19,7 @@ It is intended for personal training and experimentation. It does not depend on 
 ## Files in this repository
 
 - `cb_fba_training_psychopy.py`  
-  Main training script implementing the FBA direction‐range RDK task.
+  Training script.
 
 - `cb_fba_training_psychopy_DR.py`  
   Alternative version explicitly configured for direction‐range training (10% signal dots, 90% noise).
