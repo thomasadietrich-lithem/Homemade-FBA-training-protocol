@@ -14,7 +14,9 @@
 
 from psychopy import visual, core, event, gui, monitors, sound
 import numpy as np
-import os, csv, math, json, datetime
+import os, csv, math, json, datetime, traceback, tempfile
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ---------- Monitor / geometry helpers ----------
 
@@ -51,7 +53,7 @@ def load_or_ask_monitor():
         dlg = gui.DlgFromDict(dlg_dict, title="Screen calibration",
                               order=["Screen width (cm)", "Viewing distance (cm)"])
         if not dlg.OK:
-            core.quit()
+            return None
         try:
             width_cm = float(dlg_dict["Screen width (cm)"])
             dist_cm = float(dlg_dict["Viewing distance (cm)"])
@@ -95,11 +97,41 @@ def deg_to_pix(deg, geom):
     arcmin = deg * 60.0
     return arcmin / geom["arcmin_per_pix"]
 
+
+# ---------- SAFE SAVE helpers (PATCH 2026 - infrastructure only) ----------
+def _resolve_save_dir(save_dir: str) -> str:
+    if save_dir is None or str(save_dir).strip() == "":
+        save_dir = "data"
+    save_dir = str(save_dir)
+    if os.path.isabs(save_dir):
+        return save_dir
+    return os.path.join(BASE_DIR, save_dir)
+
+def _safe_makedirs(path_):
+    try:
+        os.makedirs(path_, exist_ok=True)
+        return True, None
+    except Exception as e:
+        return False, repr(e)
+
+def _emergency_dir():
+    for cand in [
+        os.path.join(os.path.expanduser("~"), "psychopy_data"),
+        os.path.join(tempfile.gettempdir(), "psychopy_data"),
+    ]:
+        ok, _ = _safe_makedirs(cand)
+        if ok:
+            return cand
+    return tempfile.gettempdir()
+
 # ---------- Core FBA RDK training (Direction Range) ----------
 
 def run_fba_rdk_direction_range(win, geom, subject_id, location_deg_internal, angle_set=0,
                                 n_staircases=3, n_trials_per_staircase=100,
                                 save_dir="data"):
+
+    # PATCH 2026 (infrastructure only): make save path deterministic & writable
+    resolved_save_dir = _resolve_save_dir(save_dir)
 
     H_ecc_fix = 0.0
     V_ecc_fix = 0.0
@@ -183,269 +215,318 @@ def run_fba_rdk_direction_range(win, geom, subject_id, location_deg_internal, an
     win.color = background
     win.flip()
 
-    while trial < total_trials:
-        trial += 1
-        which_stair = stair_array[trial-1]
-        if which_stair == 1:
-            angle_deviationP = angle_range[stair1-1]
-        elif which_stair == 2:
-            angle_deviationP = angle_range[stair2-1]
-        else:
-            angle_deviationP = angle_range[stair3-1]
+    abort_requested = False  # PATCH SAFE EXIT: infrastructure only
+    error_info = None  # PATCH SAFE EXIT: capture unexpected errors
+    summary_out = None  # PATCH SAFE EXIT
 
-        direction = np.random.randint(1, 3)  # 1 or 2
-        orientation = np.random.choice([-1, 1])
-
-        # ================== BASE ANGLE (central direction) ==================
-        if angle_set == 0 and direction == 1:
-            angle_deg = 0 + angle_deviationP * orientation
-        elif angle_set == 0 and direction == 2:
-            angle_deg = 180 + angle_deviationP * orientation
-        elif angle_set == 1 and direction == 1:
-            angle_deg = 270 + angle_deviationP * orientation
-        else:
-            angle_deg = 90 + angle_deviationP * orientation
-
-        # Intuitive mapping based on central direction:
-        # horizontal axis -> use vertical component
-        # vertical axis   -> use horizontal component
-        step_pix = deg_to_pix(dot_step_deg, geom)
-        angle_rad_central = math.radians(angle_deg)
-        vx_central = step_pix * math.cos(angle_rad_central)
-        vy_central = step_pix * math.sin(angle_rad_central)
-
-        if angle_set == 0:
-            # Horizontal axis, decide UP vs DOWN
-            if vy_central > 0:
-                correct_key = "up"
-                incorrect_key = "down"
+    try:
+        while trial < total_trials:
+            trial += 1
+            which_stair = stair_array[trial-1]
+            if which_stair == 1:
+                angle_deviationP = angle_range[stair1-1]
+            elif which_stair == 2:
+                angle_deviationP = angle_range[stair2-1]
             else:
-                correct_key = "down"
-                incorrect_key = "up"
-        else:
-            # Vertical axis, decide LEFT vs RIGHT
-            if vx_central < 0:
-                correct_key = "left"
-                incorrect_key = "right"
+                angle_deviationP = angle_range[stair3-1]
+    
+            direction = np.random.randint(1, 3)  # 1 or 2
+            orientation = np.random.choice([-1, 1])
+    
+            # ================== BASE ANGLE (central direction) ==================
+            if angle_set == 0 and direction == 1:
+                angle_deg = 0 + angle_deviationP * orientation
+            elif angle_set == 0 and direction == 2:
+                angle_deg = 180 + angle_deviationP * orientation
+            elif angle_set == 1 and direction == 1:
+                angle_deg = 270 + angle_deviationP * orientation
             else:
-                correct_key = "right"
-                incorrect_key = "left"
-
-        # ================== PRE-CUE ==================
-        win.callOnFlip(event.clearEvents, eventType="keyboard")
-        win.flip()
-        fx_pix = deg_to_pix(fix_x_deg, geom)
-        fy_pix = -deg_to_pix(fix_y_deg, geom)
-        target_x_pix = stim_x_pix
-        target_y_pix = stim_y_pix
-
-        cue_stim = visual.ShapeStim(
-            win,
-            vertices=[(fx_pix, fy_pix), (target_x_pix, target_y_pix)],
-            lineColor=cue_color,
-            lineWidth=2,
-            units="pix"
-        )
-        cue_stim.draw()
-        fixation.draw()
-        fixation_inner.draw()
-        win.flip()
-        core.wait(cue_duration)
-
-        fixation.draw()
-        fixation_inner.draw()
-        win.flip()
-        core.wait(0.05)
-
-        # ================== INITIALIZE DOT POSITIONS + DIRECTIONS ==================
-        stimulus_radius_pix = deg_to_pix(aperture_radius_deg, geom)
-        positions = np.zeros((n_dots, 2), dtype=float)
-        ages = np.zeros(n_dots, dtype=int)
-
-        # Random initial positions
-        for i in range(n_dots):
-            while True:
-                x = (np.random.rand() - 0.5) * 2 * stimulus_radius_pix
-                y = (np.random.rand() - 0.5) * 2 * stimulus_radius_pix
-                if x*x + y*y <= stimulus_radius_pix**2:
-                    positions[i, 0] = x
-                    positions[i, 1] = y
-                    ages[i] = np.random.randint(1, lifetime_frames+1)
-                    break
-
-        # DOT-SPECIFIC DIRECTIONS (Direction Range)
-        noise_deg = np.random.normal(loc=0.0, scale=angle_deviationP, size=n_dots)
-        dot_angles_deg = angle_deg + noise_deg
-        dot_angles_rad = np.radians(dot_angles_deg)
-        vx_dots = step_pix * np.cos(dot_angles_rad)
-        vy_dots = step_pix * np.sin(dot_angles_rad)
-
-        # ================== START BEEP ==================
-        snd_start.play()
-        core.wait(0.05)
-
-        # ================== PLAY RDK ==================
-        win.callOnFlip(event.clearEvents, eventType="keyboard")
-        win.flip()
-        clock.reset()
-
-        for f in range(mv_length):
-            # Update positions
-            for i in range(n_dots):
-                x = positions[i, 0] + vx_dots[i]
-                y = positions[i, 1] + vy_dots[i]
-                age = ages[i] + 1
-
-                # Lifetime reset
-                if age > lifetime_frames:
-                    while True:
-                        rx = (np.random.rand() - 0.5) * 2 * stimulus_radius_pix
-                        ry = (np.random.rand() - 0.5) * 2 * stimulus_radius_pix
-                        if rx*rx + ry*ry <= stimulus_radius_pix**2:
-                            x, y = rx, ry
-                            age = 1
-                            # new direction on respawn
-                            noise = np.random.normal(loc=0.0, scale=angle_deviationP)
-                            this_angle_deg = angle_deg + noise
-                            this_angle_rad = math.radians(this_angle_deg)
-                            vx_dots[i] = step_pix * math.cos(this_angle_rad)
-                            vy_dots[i] = step_pix * math.sin(this_angle_rad)
-                            break
-
-                # Wrap around
-                if x > stimulus_radius_pix:
-                    x -= 2*stimulus_radius_pix
-                elif x < -stimulus_radius_pix:
-                    x += 2*stimulus_radius_pix
-                if y > stimulus_radius_pix:
-                    y -= 2*stimulus_radius_pix
-                elif y < -stimulus_radius_pix:
-                    y += 2*stimulus_radius_pix
-
-                # Keep inside circle
-                if x*x + y*y > stimulus_radius_pix**2:
-                    while True:
-                        rx = (np.random.rand() - 0.5) * 2 * stimulus_radius_pix
-                        ry = (np.random.rand() - 0.5) * 2 * stimulus_radius_pix
-                        if rx*rx + ry*ry <= stimulus_radius_pix**2:
-                            x, y = rx, ry
-                            break
-
-                positions[i, 0] = x
-                positions[i, 1] = y
-                ages[i] = age
-
-            xys = positions.copy()
-            xys[:, 0] += stim_x_pix
-            xys[:, 1] += stim_y_pix
-            dots.xys = xys
-            dots.draw()
+                angle_deg = 90 + angle_deviationP * orientation
+    
+            # Intuitive mapping based on central direction:
+            # horizontal axis -> use vertical component
+            # vertical axis   -> use horizontal component
+            step_pix = deg_to_pix(dot_step_deg, geom)
+            angle_rad_central = math.radians(angle_deg)
+            vx_central = step_pix * math.cos(angle_rad_central)
+            vy_central = step_pix * math.sin(angle_rad_central)
+    
+            if angle_set == 0:
+                # Horizontal axis, decide UP vs DOWN
+                if vy_central > 0:
+                    correct_key = "up"
+                    incorrect_key = "down"
+                else:
+                    correct_key = "down"
+                    incorrect_key = "up"
+            else:
+                # Vertical axis, decide LEFT vs RIGHT
+                if vx_central < 0:
+                    correct_key = "left"
+                    incorrect_key = "right"
+                else:
+                    correct_key = "right"
+                    incorrect_key = "left"
+    
+            # ================== PRE-CUE ==================
+            win.callOnFlip(event.clearEvents, eventType="keyboard")
+            win.flip()
+            fx_pix = deg_to_pix(fix_x_deg, geom)
+            fy_pix = -deg_to_pix(fix_y_deg, geom)
+            target_x_pix = stim_x_pix
+            target_y_pix = stim_y_pix
+    
+            cue_stim = visual.ShapeStim(
+                win,
+                vertices=[(fx_pix, fy_pix), (target_x_pix, target_y_pix)],
+                lineColor=cue_color,
+                lineWidth=2,
+                units="pix"
+            )
+            cue_stim.draw()
             fixation.draw()
             fixation_inner.draw()
             win.flip()
-
-        fixation.draw()
-        fixation_inner.draw()
-        win.flip()
-
-        # ================== RESPONSE ==================
-        rt = None
-        correct = 0
-        keys = event.waitKeys(maxWait=2.0,
-                              keyList=[correct_key, incorrect_key, "escape"],
-                              timeStamped=clock)
-        if keys:
-            key, rt = keys[0]
-            if key == "escape":
-                win.close()
-                core.quit()
-            if key == correct_key:
-                correct = 1
-                snd_correct.play()
+            core.wait(cue_duration)
+    
+            fixation.draw()
+            fixation_inner.draw()
+            win.flip()
+            core.wait(0.05)
+    
+            # ================== INITIALIZE DOT POSITIONS + DIRECTIONS ==================
+            stimulus_radius_pix = deg_to_pix(aperture_radius_deg, geom)
+            positions = np.zeros((n_dots, 2), dtype=float)
+            ages = np.zeros(n_dots, dtype=int)
+    
+            # Random initial positions
+            for i in range(n_dots):
+                while True:
+                    x = (np.random.rand() - 0.5) * 2 * stimulus_radius_pix
+                    y = (np.random.rand() - 0.5) * 2 * stimulus_radius_pix
+                    if x*x + y*y <= stimulus_radius_pix**2:
+                        positions[i, 0] = x
+                        positions[i, 1] = y
+                        ages[i] = np.random.randint(1, lifetime_frames+1)
+                        break
+    
+            # DOT-SPECIFIC DIRECTIONS (Direction Range)
+            noise_deg = np.random.normal(loc=0.0, scale=angle_deviationP, size=n_dots)
+            dot_angles_deg = angle_deg + noise_deg
+            dot_angles_rad = np.radians(dot_angles_deg)
+            vx_dots = step_pix * np.cos(dot_angles_rad)
+            vy_dots = step_pix * np.sin(dot_angles_rad)
+    
+            # ================== START BEEP ==================
+            snd_start.play()
+            core.wait(0.05)
+    
+            # ================== PLAY RDK ==================
+            win.callOnFlip(event.clearEvents, eventType="keyboard")
+            win.flip()
+            clock.reset()
+    
+            for f in range(mv_length):
+                # Update positions
+                for i in range(n_dots):
+                    x = positions[i, 0] + vx_dots[i]
+                    y = positions[i, 1] + vy_dots[i]
+                    age = ages[i] + 1
+    
+                    # Lifetime reset
+                    if age > lifetime_frames:
+                        while True:
+                            rx = (np.random.rand() - 0.5) * 2 * stimulus_radius_pix
+                            ry = (np.random.rand() - 0.5) * 2 * stimulus_radius_pix
+                            if rx*rx + ry*ry <= stimulus_radius_pix**2:
+                                x, y = rx, ry
+                                age = 1
+                                # new direction on respawn
+                                noise = np.random.normal(loc=0.0, scale=angle_deviationP)
+                                this_angle_deg = angle_deg + noise
+                                this_angle_rad = math.radians(this_angle_deg)
+                                vx_dots[i] = step_pix * math.cos(this_angle_rad)
+                                vy_dots[i] = step_pix * math.sin(this_angle_rad)
+                                break
+    
+                    # Wrap around
+                    if x > stimulus_radius_pix:
+                        x -= 2*stimulus_radius_pix
+                    elif x < -stimulus_radius_pix:
+                        x += 2*stimulus_radius_pix
+                    if y > stimulus_radius_pix:
+                        y -= 2*stimulus_radius_pix
+                    elif y < -stimulus_radius_pix:
+                        y += 2*stimulus_radius_pix
+    
+                    # Keep inside circle
+                    if x*x + y*y > stimulus_radius_pix**2:
+                        while True:
+                            rx = (np.random.rand() - 0.5) * 2 * stimulus_radius_pix
+                            ry = (np.random.rand() - 0.5) * 2 * stimulus_radius_pix
+                            if rx*rx + ry*ry <= stimulus_radius_pix**2:
+                                x, y = rx, ry
+                                break
+    
+                    positions[i, 0] = x
+                    positions[i, 1] = y
+                    ages[i] = age
+    
+                xys = positions.copy()
+                xys[:, 0] += stim_x_pix
+                xys[:, 1] += stim_y_pix
+                dots.xys = xys
+                dots.draw()
+                fixation.draw()
+                fixation_inner.draw()
+                win.flip()
+    
+            fixation.draw()
+            fixation_inner.draw()
+            win.flip()
+    
+            # ================== RESPONSE ==================
+            rt = None
+            correct = 0
+            keys = event.waitKeys(maxWait=2.0,
+                                  keyList=[correct_key, incorrect_key, "escape"],
+                                  timeStamped=clock)
+            if keys:
+                key, rt = keys[0]
+                if key == "escape":
+                    abort_requested = True  # PATCH SAFE EXIT: do not hard-quit
+                    break
+                if key == correct_key:
+                    correct = 1
+                    snd_correct.play()
+                else:
+                    correct = 0
+                    snd_incorrect.play()
+    
+            # ================== STAIRCASE UPDATE ==================
+            if correct:
+                if which_stair == 1:
+                    staircount1 += 1
+                    if staircount1 >= 3:
+                        stair1 = min(stair1 + 1, len(angle_range))
+                        staircount1 = 0
+                elif which_stair == 2:
+                    staircount2 += 1
+                    if staircount2 >= 3:
+                        stair2 = min(stair2 + 1, len(angle_range))
+                        staircount2 = 0
+                else:
+                    staircount3 += 1
+                    if staircount3 >= 3:
+                        stair3 = min(stair3 + 1, len(angle_range))
+                        staircount3 = 0
             else:
-                correct = 0
-                snd_incorrect.play()
-
-        # ================== STAIRCASE UPDATE ==================
-        if correct:
-            if which_stair == 1:
-                staircount1 += 1
-                if staircount1 >= 3:
-                    stair1 = min(stair1 + 1, len(angle_range))
+                if which_stair == 1:
+                    stair1 = max(1, stair1 - 1)
                     staircount1 = 0
-            elif which_stair == 2:
-                staircount2 += 1
-                if staircount2 >= 3:
-                    stair2 = min(stair2 + 1, len(angle_range))
+                elif which_stair == 2:
+                    stair2 = max(1, stair2 - 1)
                     staircount2 = 0
-            else:
-                staircount3 += 1
-                if staircount3 >= 3:
-                    stair3 = min(stair3 + 1, len(angle_range))
+                else:
+                    stair3 = max(1, stair3 - 1)
                     staircount3 = 0
-        else:
-            if which_stair == 1:
-                stair1 = max(1, stair1 - 1)
-                staircount1 = 0
-            elif which_stair == 2:
-                stair2 = max(1, stair2 - 1)
-                staircount2 = 0
-            else:
-                stair3 = max(1, stair3 - 1)
-                staircount3 = 0
+    
+            results.append([
+                trial,
+                angle_deviationP,
+                which_stair,
+                direction,
+                orientation,
+                rt if rt is not None else float("nan"),
+                correct,
+                angle_deg
+            ])
+    
+            fixation.draw()
+            fixation_inner.draw()
+            win.flip()
+            core.wait(0.5)
+    
+    except Exception as e:
+        error_info = repr(e)
 
-        results.append([
-            trial,
-            angle_deviationP,
-            which_stair,
-            direction,
-            orientation,
-            rt if rt is not None else float("nan"),
-            correct,
-            angle_deg
-        ])
+    finally:
+        # ================== SUMMARY / SAVE ==================
+        # PATCH 2026 (infrastructure only): attempt to save outputs even if session aborted or an exception occurred.
+        try:
+            correct_trials = sum(r[6] for r in results)
+            accuracy = 100.0 * correct_trials / max(1, len(results))
+            final_thresh = (angle_range[stair1-1] +
+                            angle_range[stair2-1] +
+                            angle_range[stair3-1]) / 3.0
 
-        fixation.draw()
-        fixation_inner.draw()
-        win.flip()
-        core.wait(0.5)
+            ok, mk_err = _safe_makedirs(resolved_save_dir)
+            if not ok:
+                resolved_save_dir = _emergency_dir()
 
-    # ================== SUMMARY / SAVE ==================
-    correct_trials = sum(r[6] for r in results)
-    accuracy = 100.0 * correct_trials / len(results)
-    final_thresh = (angle_range[stair1-1] +
-                    angle_range[stair2-1] +
-                    angle_range[stair3-1]) / 3.0
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            base = f"{subject_id}_FBA_DR_{ts}"
 
-    if not os.path.isdir(save_dir):
-        os.makedirs(save_dir)
-    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    base = f"{subject_id}_FBA_DR_{ts}"
-    csv_path = os.path.join(save_dir, base + "_trials.csv")
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["trial", "angle_dev_deg", "staircase", "direction_code",
-                    "orientation_sign", "rt_s", "correct", "angle_deg"])
-        for row in results:
-            w.writerow(row)
+            csv_path = os.path.join(resolved_save_dir, base + "_trials.csv")
+            with open(csv_path, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow(["trial", "angle_dev_deg", "staircase", "direction_code",
+                            "orientation_sign", "rt_s", "correct", "angle_deg"])
+                for row in results:
+                    w.writerow(row)
 
-    summary_path = os.path.join(save_dir, base + "_summary.json")
-    summary = {
-        "subject": subject_id,
-        "task": "FBA_RDK_DirectionRange",
-        "location_deg_internal": {"H": H_ecc_stim, "V_internal": V_ecc_stim_internal},
-        "angle_set": angle_set,
-        "n_trials": len(results),
-        "accuracy_percent": accuracy,
-        "final_threshold_deg": final_thresh,
-        "stair_levels": {"stair1": stair1, "stair2": stair2, "stair3": stair3},
-        "angle_range": angle_range,
-        "timestamp": ts,
-    }
-    with open(summary_path, "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2)
+            summary_path = os.path.join(resolved_save_dir, base + "_summary.json")
+            summary = {
+                "subject": subject_id,
+                "task": "FBA_RDK_DirectionRange",
+                "location_deg_internal": {"H": H_ecc_stim, "V_internal": V_ecc_stim_internal},
+                "angle_set": angle_set,
+                "n_trials": len(results),
+                "accuracy_percent": accuracy,
+                "final_threshold_deg": final_thresh,
+                "stair_levels": {"stair1": stair1, "stair2": stair2, "stair3": stair3},
+                "angle_range": angle_range,
+                "timestamp": ts,
+                "aborted": bool(abort_requested),
+                "error": error_info,
+            }
+            with open(summary_path, "w", encoding="utf-8") as f:
+                json.dump(summary, f, indent=2)
 
-    return summary
+            summary_out = summary
+
+        except Exception as save_exc:
+            fallback_dir = _emergency_dir()
+            ts2 = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            base2 = f"{subject_id}_FBA_DR_RECOVERY_{ts2}"
+
+            try:
+                rec_csv = os.path.join(fallback_dir, base2 + "_trials.csv")
+                with open(rec_csv, "w", newline="", encoding="utf-8") as f:
+                    w = csv.writer(f)
+                    w.writerow(["trial", "angle_dev_deg", "staircase", "direction_code",
+                                "orientation_sign", "rt_s", "correct", "angle_deg"])
+                    for row in results:
+                        w.writerow(row)
+            except Exception:
+                pass
+
+            try:
+                rec_json = os.path.join(fallback_dir, base2 + "_recovery.json")
+                payload = {
+                    "subject": subject_id,
+                    "n_trials": len(results),
+                    "aborted": bool(abort_requested),
+                    "error": error_info,
+                    "save_error": repr(save_exc),
+                }
+                with open(rec_json, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, indent=2)
+            except Exception:
+                pass
+
+    return summary_out
+
 
 # ---------- Main entry point ----------
 
@@ -458,7 +539,7 @@ def main():
     }
     dlg = gui.DlgFromDict(info, title="CB training (Direction Range enabled, FBA)")
     if not dlg.OK:
-        core.quit()
+        return None
 
     subject_id = str(info["Subject ID"])
     angle_set = int(info["Angle set (0=horizontal axis/UP-DOWN, 1=vertical axis/LEFT-RIGHT)"])
@@ -503,23 +584,46 @@ def main():
     keys = event.waitKeys(keyList=["space", "escape"])
     if "escape" in keys:
         win.close()
-        core.quit()
+        return None
 
     summary_fba = run_fba_rdk_direction_range(win, geom, subject_id, (H_internal, V_internal),
                                               angle_set=angle_set)
 
-    msg = (
-        "Training complete (Direction Range)!\n\n"
-        f"Accuracy: {summary_fba['accuracy_percent']:.1f}%\n"
-        f"Final direction threshold (avg of 3 staircases): {summary_fba['final_threshold_deg']:.2f} deg\n\n"
-        "Press any key to exit."
-    )
+    if summary_fba is None:
+        msg = (
+            "Session ended early.\n\n"
+            "No summary could be generated, but any collected data should be in the data folder.\n\n"
+            "Press any key to exit."
+        )
+    else:
+        if summary_fba.get("error"):
+            msg = (
+                "Session ended due to an unexpected error.\n\n"
+                f"Trials saved: {summary_fba.get('n_trials', 0)}\n"
+                "Please check the data folder for the CSV/JSON files.\n\n"
+                "Press any key to exit."
+            )
+        elif summary_fba.get("aborted"):
+            msg = (
+                "Session interrupted.\n\n"
+                f"Trials saved: {summary_fba.get('n_trials', 0)}\n"
+                f"Accuracy so far: {summary_fba.get('accuracy_percent', float('nan')):.1f}%\n"
+                f"Current threshold estimate: {summary_fba.get('final_threshold_deg', float('nan')):.2f} deg\n\n"
+                "Press any key to exit."
+            )
+        else:
+            msg = (
+                "Training complete (Direction Range)!\n\n"
+                f"Accuracy: {summary_fba['accuracy_percent']:.1f}%\n"
+                f"Final direction threshold (avg of 3 staircases): {summary_fba['final_threshold_deg']:.2f} deg\n\n"
+                "Press any key to exit."
+            )
     text = visual.TextStim(win, text=msg, color=-1, height=0.8)
     text.draw()
     win.flip()
     event.waitKeys()
     win.close()
-    core.quit()
+    return None
 
 if __name__ == "__main__":
     main()
