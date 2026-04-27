@@ -1,0 +1,1259 @@
+import os
+import re
+import glob
+import json
+import html
+import webbrowser
+from datetime import datetime
+from collections import defaultdict
+
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from scipy.optimize import minimize
+
+# ============================================================
+# Huxlin-style standalone dashboard for FBA / TiltGlobal home-training CSV files
+# ============================================================
+#
+# Scope:
+# - descriptive analysis only; no automatic clinical decision rule
+# - one psychometric Weibull fit per session
+# - one longitudinal dashboard per trained location
+# - one within-session block performance dashboard per trained location
+# - one stimulus-direction comparison dashboard per trained location
+#
+# Core lineage retained from the previous analyser:
+# - fine-task fit is performed in log10(angle_deg + 1)
+# - chance = 0.5
+# - lapse = 0.05
+# - threshold target = 0.725
+#
+# Additional descriptive views requested:
+# - raw accuracy and threshold overlay over sessions
+# - within-session accuracy split into equal trial blocks, plotted for recent sessions
+# - stimulus class comparison: UP vs DOWN for angle_set=0, LEFT vs RIGHT for angle_set=1
+# - V7 additions: fit likelihood metrics, stimulus-level distribution,
+#   3-session pooled thresholds, and variability summaries
+#
+# Output folder:
+# - analysis_results/ next to the data folder whenever CSV files live in ./data
+#
+
+CHANCE = 0.5
+LAPSE_RATE = 0.05
+THRESHOLD_TARGET = 0.725
+
+MIN_TRIALS_FOR_SESSION_FIT = 80
+MIN_UNIQUE_LEVELS_FOR_SESSION_FIT = 4
+N_BLOCKS_WITHIN_SESSION = 6
+RECENT_SESSION_WINDOW = 5
+
+
+def make_writable_output_path(path):
+    base, ext = os.path.splitext(path)
+    candidate = path
+    idx = 1
+    while True:
+        try:
+            parent = os.path.dirname(candidate)
+            os.makedirs(parent, exist_ok=True)
+            with open(candidate, "ab"):
+                pass
+            return candidate
+        except Exception:
+            candidate = f"{base}_{idx}{ext}"
+            idx += 1
+
+
+def weibull_logspace(x_log, alpha_log, beta):
+    xx = np.maximum(x_log, 1e-9)
+    aa = max(alpha_log, 1e-9)
+    return CHANCE + (1.0 - CHANCE - LAPSE_RATE) * (1.0 - np.exp(- (xx / aa) ** beta))
+
+
+def neg_log_likelihood(params, x_log, y_bin):
+    alpha_log, beta = params
+    p = np.clip(weibull_logspace(x_log, alpha_log, beta), 1e-6, 1.0 - 1e-6)
+    return -np.sum(y_bin * np.log(p) + (1 - y_bin) * np.log(1 - p))
+
+
+def bernoulli_log_likelihood_from_prob(y_bin, p):
+    p = np.clip(np.asarray(p, dtype=float), 1e-6, 1.0 - 1e-6)
+    y = np.asarray(y_bin, dtype=float)
+    return float(np.sum(y * np.log(p) + (1.0 - y) * np.log(1.0 - p)))
+
+
+def fit_quality_metrics(x_log, y_bin, alpha_log, beta):
+    """Return descriptive likelihood metrics for the fitted Weibull.
+
+    These are fit-quality aids only. They do not change the fitted threshold and
+    they are not used for automatic decision-making.
+    """
+    model_p = weibull_logspace(x_log, alpha_log, beta)
+    ll_model = bernoulli_log_likelihood_from_prob(y_bin, model_p)
+    empirical_p = float(np.mean(y_bin)) if len(y_bin) else CHANCE
+    empirical_p = float(np.clip(empirical_p, 1e-6, 1.0 - 1e-6))
+    null_p = np.full_like(y_bin, empirical_p, dtype=float)
+    ll_null = bernoulli_log_likelihood_from_prob(y_bin, null_p)
+    pseudo_r2 = None
+    if ll_null != 0 and np.isfinite(ll_null):
+        pseudo_r2 = 1.0 - (ll_model / ll_null)
+    n = int(len(y_bin)); k = 2
+    return {
+        "fit_log_likelihood": float(ll_model),
+        "null_log_likelihood": float(ll_null),
+        "fit_pseudo_r2": float(pseudo_r2) if pseudo_r2 is not None and np.isfinite(pseudo_r2) else None,
+        "fit_aic": float(2 * k - 2 * ll_model),
+        "fit_bic": float(k * np.log(max(n, 1)) - 2 * ll_model),
+    }
+
+
+def threshold_from_params(alpha_log, beta):
+    scaled = (THRESHOLD_TARGET - CHANCE) / (1.0 - CHANCE - LAPSE_RATE)
+    scaled = np.clip(scaled, 1e-9, 1.0 - 1e-9)
+    x_thr_log = alpha_log * ((-np.log(1.0 - scaled)) ** (1.0 / beta))
+    thr_deg = (10.0 ** x_thr_log) - 1.0
+    return max(0.0, float(thr_deg)), float(x_thr_log)
+
+
+def parse_timestamp_from_name(path):
+    name = os.path.basename(path)
+    m = re.search(r'_(\d{8}_\d{6})_(?:trials|summary)\.', name)
+    if not m:
+        return None
+    try:
+        return datetime.strptime(m.group(1), "%Y%m%d_%H%M%S")
+    except Exception:
+        return None
+
+
+def companion_summary_path(csv_path):
+    return csv_path.replace("_trials.csv", "_summary.json")
+
+
+def load_companion_summary(csv_path):
+    p = companion_summary_path(csv_path)
+    if not os.path.isfile(p):
+        return None
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def infer_location_id(csv_path):
+    meta = load_companion_summary(csv_path)
+    if meta:
+        try:
+            loc = meta.get("location_deg_internal", {})
+            h = float(loc.get("H"))
+            v = float(loc.get("V_internal"))
+            return f"H{h:+.2f}_V{v:+.2f}", meta
+        except Exception:
+            pass
+    return "unknown_location", meta
+
+
+def output_directory_for(csv_paths):
+    first_dir = os.path.dirname(os.path.abspath(csv_paths[0]))
+    parent = os.path.dirname(first_dir) if os.path.basename(first_dir).lower() == "data" else first_dir
+    candidate = os.path.join(parent, "analysis_results")
+    try:
+        os.makedirs(candidate, exist_ok=True)
+        testfile = os.path.join(candidate, ".write_test")
+        with open(testfile, "w", encoding="utf-8") as f:
+            f.write("ok")
+        os.remove(testfile)
+        return candidate
+    except Exception:
+        fallback = os.path.join(first_dir, "analysis_results")
+        os.makedirs(fallback, exist_ok=True)
+        return fallback
+
+
+def discover_csvs():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    cwd = os.getcwd()
+    patterns = [
+        os.path.join(cwd, "data", "*_trials.csv"),
+        os.path.join(script_dir, "data", "*_trials.csv"),
+        os.path.join(script_dir, "*_trials.csv"),
+    ]
+    for patt in patterns:
+        found = sorted(glob.glob(patt))
+        if found:
+            return found
+    return []
+
+
+def clean_trial_frame(csv_path):
+    df = pd.read_csv(csv_path)
+    required = {"angle_dev_deg", "correct"}
+    missing = sorted(required - set(df.columns))
+    if missing:
+        raise ValueError(f"Missing required columns {missing} in {os.path.basename(csv_path)}")
+
+    # Preserve optional columns if present.
+    keep = [c for c in ["trial", "angle_dev_deg", "staircase", "direction_code", "orientation_sign", "rt_s", "correct", "angle_deg"] if c in df.columns]
+    dd = df[keep].copy()
+    dd = dd.replace([np.inf, -np.inf], np.nan)
+    dd["angle_dev_deg"] = pd.to_numeric(dd["angle_dev_deg"], errors="coerce")
+
+    # Strict but tolerant correctness normalization.
+    if dd["correct"].dtype == bool:
+        dd["correct"] = dd["correct"].astype(int)
+    else:
+        dd["correct"] = dd["correct"].replace({
+            True: 1, False: 0,
+            "True": 1, "False": 0, "true": 1, "false": 0,
+            "TRUE": 1, "FALSE": 0,
+            "correct": 1, "incorrect": 0,
+            "Correct": 1, "Incorrect": 0,
+        })
+        dd["correct"] = pd.to_numeric(dd["correct"], errors="coerce")
+    if "trial" in dd.columns:
+        dd["trial"] = pd.to_numeric(dd["trial"], errors="coerce")
+    if "angle_deg" in dd.columns:
+        dd["angle_deg"] = pd.to_numeric(dd["angle_deg"], errors="coerce")
+    if "direction_code" in dd.columns:
+        dd["direction_code"] = pd.to_numeric(dd["direction_code"], errors="coerce")
+    if "orientation_sign" in dd.columns:
+        dd["orientation_sign"] = pd.to_numeric(dd["orientation_sign"], errors="coerce")
+
+    dd = dd.dropna(subset=["angle_dev_deg", "correct"])
+    dd = dd[(dd["angle_dev_deg"] >= 0) & (dd["correct"].isin([0, 1]))].copy()
+    dd["correct"] = dd["correct"].astype(float)
+    if len(dd) == 0:
+        raise ValueError(f"No valid trial rows after cleaning {os.path.basename(csv_path)}")
+    if "trial" in dd.columns:
+        dd = dd.sort_values("trial")
+    else:
+        dd = dd.reset_index(drop=True)
+        dd["trial"] = np.arange(1, len(dd) + 1)
+    return dd
+
+
+def stimulus_class_from_trials(dd, angle_set):
+    """Return class labels for each trial: UP/DOWN or LEFT/RIGHT when possible."""
+    labels = pd.Series(["unknown"] * len(dd), index=dd.index, dtype="object")
+    if "angle_deg" in dd.columns and dd["angle_deg"].notna().any():
+        ang = np.deg2rad(dd["angle_deg"].astype(float).to_numpy())
+        if angle_set == 0:
+            labels[:] = np.where(np.sin(ang) > 0, "UP", "DOWN")
+        elif angle_set == 1:
+            labels[:] = np.where(np.cos(ang) < 0, "LEFT", "RIGHT")
+        else:
+            labels[:] = "unknown"
+    elif "orientation_sign" in dd.columns:
+        # Fallback only: sign is not always equivalent across base directions, but it is better than dropping the view.
+        if angle_set == 0:
+            labels[:] = np.where(dd["orientation_sign"].astype(float) > 0, "tilt +", "tilt -")
+        elif angle_set == 1:
+            labels[:] = np.where(dd["orientation_sign"].astype(float) > 0, "tilt +", "tilt -")
+    return labels
+
+
+def fit_session(csv_path):
+    dd = clean_trial_frame(csv_path)
+    timestamp = parse_timestamp_from_name(csv_path)
+    location_id, meta = infer_location_id(csv_path)
+
+    result = {
+        "source_csv": os.path.basename(csv_path),
+        "source_csv_abs": os.path.abspath(csv_path),
+        "timestamp": timestamp.strftime("%Y-%m-%d %H:%M:%S") if timestamp else None,
+        "location_id": location_id,
+        "n_trials": int(len(dd)),
+        "n_unique_levels": int(dd["angle_dev_deg"].nunique()),
+        "accuracy_percent": float(dd["correct"].mean() * 100.0) if len(dd) else None,
+        "fit_valid": False,
+        "fit_failure_reason": None,
+        "threshold_deg": None,
+        "threshold_log10_plus1": None,
+        "alpha_log": None,
+        "beta": None,
+        "fit_log_likelihood": None,
+        "null_log_likelihood": None,
+        "fit_pseudo_r2": None,
+        "fit_aic": None,
+        "fit_bic": None,
+        "percent_correct_easiest": None,
+        "percent_correct_table": [],
+        "coarse_session_staircase_estimate_deg": None,
+        "block_accuracy": [],
+        "stimulus_class_accuracy": [],
+    }
+
+    angle_set = None
+    if meta is not None:
+        result["companion_summary"] = os.path.basename(companion_summary_path(csv_path))
+        result["coarse_session_staircase_estimate_deg"] = meta.get("coarse_session_staircase_estimate_deg") or meta.get("final_threshold_deg")
+        result["location_deg_internal"] = meta.get("location_deg_internal")
+        result["angle_set"] = meta.get("angle_set")
+        angle_set = meta.get("angle_set")
+        result["fixed_protocol"] = meta.get("fixed_protocol")
+        result["training_lineage"] = meta.get("source_lineage")
+    if angle_set is None:
+        angle_set = 0
+        result["angle_set"] = angle_set
+    try:
+        angle_set = int(angle_set)
+    except Exception:
+        angle_set = 0
+
+    grouped = dd.groupby("angle_dev_deg")["correct"].agg(["mean", "count"]).reset_index().sort_values("angle_dev_deg")
+    for _, row in grouped.iterrows():
+        result["percent_correct_table"].append({
+            "angle_deg": float(row["angle_dev_deg"]),
+            "angle_plus1_deg": float(row["angle_dev_deg"] + 1.0),
+            "n": int(row["count"]),
+            "percent_correct": float(row["mean"] * 100.0),
+            "proportion_correct": float(row["mean"]),
+        })
+
+    if len(grouped) > 0:
+        result["percent_correct_easiest"] = float(grouped.iloc[-1]["mean"] * 100.0)
+
+    # Within-session block accuracy: descriptive only.
+    if len(dd) > 0:
+        block_ids = np.floor(np.linspace(0, N_BLOCKS_WITHIN_SESSION, len(dd), endpoint=False)).astype(int) + 1
+        block_ids = np.clip(block_ids, 1, N_BLOCKS_WITHIN_SESSION)
+        dd_blocks = dd.copy()
+        dd_blocks["block"] = block_ids
+        btab = dd_blocks.groupby("block")["correct"].agg(["mean", "count"]).reset_index()
+        for _, row in btab.iterrows():
+            result["block_accuracy"].append({
+                "block": int(row["block"]),
+                "n": int(row["count"]),
+                "accuracy_percent": float(row["mean"] * 100.0),
+            })
+
+        labels = stimulus_class_from_trials(dd, angle_set)
+        dd_cls = dd.copy()
+        dd_cls["stimulus_class"] = labels
+        ctab = dd_cls.groupby("stimulus_class")["correct"].agg(["mean", "count"]).reset_index()
+        for _, row in ctab.iterrows():
+            result["stimulus_class_accuracy"].append({
+                "stimulus_class": str(row["stimulus_class"]),
+                "n": int(row["count"]),
+                "accuracy_percent": float(row["mean"] * 100.0),
+            })
+
+    if result["n_trials"] < MIN_TRIALS_FOR_SESSION_FIT:
+        result["fit_failure_reason"] = f"too_few_trials (<{MIN_TRIALS_FOR_SESSION_FIT})"
+        return result
+    if result["n_unique_levels"] < MIN_UNIQUE_LEVELS_FOR_SESSION_FIT:
+        result["fit_failure_reason"] = f"too_few_unique_levels (<{MIN_UNIQUE_LEVELS_FOR_SESSION_FIT})"
+        return result
+
+    x_log = np.log10(dd["angle_dev_deg"].to_numpy(dtype=float) + 1.0)
+    y_bin = dd["correct"].to_numpy(dtype=float)
+
+    xmin = max(1e-6, float(np.min(x_log)))
+    xmax = max(xmin + 1e-6, float(np.max(x_log)))
+    starts = [
+        (np.median(x_log), 2.0),
+        (xmax * 0.75, 2.0),
+        (xmax * 0.90, 3.0),
+        (max(xmin, xmax * 0.50), 1.5),
+    ]
+
+    best = None
+    for a0, b0 in starts:
+        try:
+            res = minimize(
+                neg_log_likelihood,
+                x0=np.array([a0, b0], dtype=float),
+                args=(x_log, y_bin),
+                method="L-BFGS-B",
+                bounds=[(xmin, xmax), (0.25, 12.0)],
+            )
+            if best is None or res.fun < best.fun:
+                best = res
+        except Exception:
+            continue
+
+    if best is None or not np.isfinite(best.fun):
+        result["fit_failure_reason"] = "optimizer_failed"
+        return result
+
+    alpha_log = float(best.x[0])
+    beta = float(best.x[1])
+    thr_deg, thr_log = threshold_from_params(alpha_log, beta)
+
+    observed_max = float(np.max(dd["angle_dev_deg"]))
+    if not np.isfinite(thr_deg):
+        result["fit_failure_reason"] = "non_finite_threshold"
+        return result
+    if thr_deg < 0 or thr_deg > max(observed_max * 1.5, observed_max + 5):
+        result["fit_failure_reason"] = "threshold_outside_reasonable_session_range"
+        return result
+
+    result["fit_valid"] = True
+    result["threshold_deg"] = float(thr_deg)
+    result["threshold_log10_plus1"] = float(thr_log)
+    result["alpha_log"] = alpha_log
+    result["beta"] = beta
+    result.update(fit_quality_metrics(x_log, y_bin, alpha_log, beta))
+    return result
+
+
+def add_percent_axis_formatting():
+    y_ticks = np.arange(0.0, 101.0, 10.0)
+    plt.yticks(y_ticks, [f"{int(v)}" for v in y_ticks])
+    plt.ylim(0.0, 102.0)
+
+
+def add_secondary_degree_axis(ax):
+    def forward_log_to_deg(x):
+        return (10.0 ** np.asarray(x)) - 1.0
+    def inverse_deg_to_log(x):
+        x = np.asarray(x)
+        return np.log10(np.maximum(x, 0.0) + 1.0)
+    secax = ax.secondary_xaxis('top', functions=(forward_log_to_deg, inverse_deg_to_log))
+    secax.set_xlabel("angle difference (deg)")
+    deg_ticks = [0.5, 0.8, 1.2, 2, 3.2, 5.1, 8.1, 12.97, 20.75, 33.2, 53.1, 85, 90]
+    xlo, xhi = ax.get_xlim()
+    allowed = [d for d in deg_ticks if xlo <= np.log10(d + 1.0) <= xhi]
+    if allowed:
+        secax.set_xticks(allowed)
+        secax.set_xticklabels([f"{d:g}" for d in allowed])
+    return secax
+
+
+def save_session_plot(session_result, out_dir):
+    csv_path = session_result["source_csv_abs"]
+    out_base = os.path.splitext(os.path.basename(csv_path))[0].replace("_trials", "")
+    out_png = make_writable_output_path(os.path.join(out_dir, f"{out_base}_psychometric_weibull.png"))
+    out_json = make_writable_output_path(os.path.join(out_dir, f"{out_base}_session_summary.json"))
+
+    with open(out_json, "w", encoding="utf-8") as f:
+        json.dump(session_result, f, indent=2)
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    tbl = session_result.get("percent_correct_table", [])
+    if tbl:
+        xs = np.array([r["angle_plus1_deg"] for r in tbl], dtype=float)
+        ys = np.array([r["percent_correct"] for r in tbl], dtype=float)
+        ns = np.array([r["n"] for r in tbl], dtype=int)
+        xlog = np.log10(xs)
+        ax.scatter(xlog, ys, s=np.clip(ns * 8, 30, 220), alpha=0.9)
+        for x, y, n in zip(xlog, ys, ns):
+            ax.annotate(f"n={n}", (x, y), textcoords="offset points", xytext=(0, 6), ha="center", fontsize=8)
+        if session_result["fit_valid"]:
+            grid_deg = np.linspace(max(0, min(xs) - 1.0), max(xs) - 1.0, 300)
+            grid_log = np.log10(grid_deg + 1.0)
+            curve = weibull_logspace(grid_log, session_result["alpha_log"], session_result["beta"]) * 100.0
+            ax.plot(grid_log, curve, linewidth=2)
+            thr_deg = session_result["threshold_deg"]
+            thr_log = np.log10(thr_deg + 1.0)
+            ax.axvline(thr_log, linestyle="--", linewidth=1)
+            ax.annotate(f"thr={thr_deg:.2f}°", (thr_log, THRESHOLD_TARGET * 100.0),
+                        textcoords="offset points", xytext=(6, 6), fontsize=9)
+        title = f"{session_result['source_csv']} | {session_result['location_id']}\ntrials={session_result['n_trials']} | levels={session_result['n_unique_levels']}"
+    else:
+        title = f"{session_result['source_csv']} | no usable data"
+    ax.set_xlabel("log10(angle + 1)")
+    ax.set_ylabel("percent correct (%)")
+    ax.set_ylim(0, 102)
+    ax.set_yticks(np.arange(0, 101, 10))
+    add_secondary_degree_axis(ax)
+    ax.set_title(title, fontsize=10)
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=150)
+    plt.close(fig)
+    return out_png, out_json
+
+
+def save_staircase_plot(session_result, out_dir):
+    csv_path = session_result["source_csv_abs"]
+    out_base = os.path.splitext(os.path.basename(csv_path))[0].replace("_trials", "")
+    out_png = make_writable_output_path(os.path.join(out_dir, f"{out_base}_staircase_trace.png"))
+    try:
+        dd = clean_trial_frame(csv_path)
+    except Exception:
+        return None
+    fig, ax = plt.subplots(figsize=(10, 4))
+    if "staircase" in dd.columns and dd["staircase"].notna().any():
+        for stair, sub in dd.groupby("staircase"):
+            ax.plot(sub["trial"], sub["angle_dev_deg"], marker="o", markersize=2.5, linewidth=0.8, label=f"staircase {int(stair)}")
+        ax.legend(fontsize=8)
+    else:
+        ax.plot(dd["trial"], dd["angle_dev_deg"], marker="o", markersize=2.5, linewidth=0.8)
+    ax.set_xlabel("trial")
+    ax.set_ylabel("angle difference (deg)")
+    ax.set_title(f"Staircase trace | {session_result['source_csv']} | {session_result['location_id']}")
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=150)
+    plt.close(fig)
+    return out_png
+
+
+def save_distribution_plot(session_result, out_dir):
+    """Stimulus-level distribution for one session (staircase coverage view)."""
+    csv_path = session_result["source_csv_abs"]
+    out_base = os.path.splitext(os.path.basename(csv_path))[0].replace("_trials", "")
+    out_png = make_writable_output_path(os.path.join(out_dir, f"{out_base}_stimulus_distribution.png"))
+    try:
+        dd = clean_trial_frame(csv_path)
+    except Exception:
+        return None
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    levels = np.sort(dd["angle_dev_deg"].dropna().unique())
+    counts = dd.groupby("angle_dev_deg")["correct"].count().reindex(levels).fillna(0).to_numpy()
+    ax.bar(np.arange(len(levels)), counts, width=0.8)
+    ax.set_xticks(np.arange(len(levels)))
+    ax.set_xticklabels([f"{v:g}" for v in levels], rotation=45, ha="right", fontsize=8)
+    ax.set_xlabel("angle difference level (deg)")
+    ax.set_ylabel("trial count")
+    ax.set_title(f"Stimulus-level distribution | {session_result['source_csv']} | {session_result['location_id']}")
+    fig.tight_layout(); fig.savefig(out_png, dpi=150); plt.close(fig)
+    return out_png
+
+
+def _fit_threshold_from_dataframe(dd):
+    """Fit a threshold from an already-cleaned concatenated trial dataframe."""
+    if len(dd) < MIN_TRIALS_FOR_SESSION_FIT or dd["angle_dev_deg"].nunique() < MIN_UNIQUE_LEVELS_FOR_SESSION_FIT:
+        return np.nan
+    x_log = np.log10(dd["angle_dev_deg"].to_numpy(dtype=float) + 1.0)
+    y_bin = dd["correct"].to_numpy(dtype=float)
+    xmin = max(1e-6, float(np.min(x_log))); xmax = max(xmin + 1e-6, float(np.max(x_log)))
+    starts = [(np.median(x_log), 2.0), (xmax * 0.75, 2.0), (xmax * 0.90, 3.0), (max(xmin, xmax * 0.50), 1.5)]
+    best = None
+    for a0, b0 in starts:
+        try:
+            res = minimize(neg_log_likelihood, x0=np.array([a0, b0], dtype=float), args=(x_log, y_bin), method="L-BFGS-B", bounds=[(xmin, xmax), (0.25, 12.0)])
+            if best is None or res.fun < best.fun:
+                best = res
+        except Exception:
+            continue
+    if best is None or not np.isfinite(best.fun):
+        return np.nan
+    thr_deg, _ = threshold_from_params(float(best.x[0]), float(best.x[1]))
+    observed_max = float(np.max(dd["angle_dev_deg"]))
+    if not np.isfinite(thr_deg) or thr_deg < 0 or thr_deg > max(observed_max * 1.5, observed_max + 5):
+        return np.nan
+    return float(thr_deg)
+
+
+def pooled_thresholds_by_window(sessions, window=3):
+    """Return rolling pooled Weibull thresholds over the previous `window` sessions."""
+    ordered = sorted([s for s in sessions if s.get("timestamp") is not None], key=lambda s: s["timestamp"])
+    pooled = []
+    for i in range(len(ordered)):
+        subset = ordered[max(0, i - window + 1): i + 1]
+        dfs = []
+        for s in subset:
+            try:
+                dfs.append(clean_trial_frame(s["source_csv_abs"]))
+            except Exception:
+                pass
+        pooled.append(np.nan if not dfs else _fit_threshold_from_dataframe(pd.concat(dfs, ignore_index=True)))
+    return np.array(pooled, dtype=float)
+
+
+def rolling_mean(values, window=3):
+    s = pd.Series(values, dtype=float)
+    return s.rolling(window=window, min_periods=1).mean().to_numpy()
+
+
+def save_longitudinal_overlay_plot(location_id, sessions, out_dir):
+    valid = [s for s in sessions if s.get("timestamp") is not None]
+    valid = sorted(valid, key=lambda s: s["timestamp"])
+    out_png = make_writable_output_path(os.path.join(out_dir, f"longitudinal_{location_id}_accuracy_threshold_overlay.png"))
+
+    fig, ax_thr = plt.subplots(figsize=(13, 6))
+    if valid:
+        x = np.arange(1, len(valid) + 1)
+        dates = [datetime.strptime(s["timestamp"], "%Y-%m-%d %H:%M:%S").strftime("%m-%d\n%H:%M") for s in valid]
+        thresholds = np.array([s["threshold_deg"] if s.get("fit_valid") else np.nan for s in valid], dtype=float)
+        acc = np.array([s.get("accuracy_percent", np.nan) for s in valid], dtype=float)
+        ntr = [s.get("n_trials") for s in valid]
+
+        ax_thr.plot(x, thresholds, marker="o", linewidth=1.4, label="Weibull threshold (deg)")
+        ax_thr.plot(x, rolling_mean(thresholds, 3), linestyle="--", linewidth=1.4, label="3-session mean threshold")
+        pooled_thr = pooled_thresholds_by_window(valid, window=3)
+        ax_thr.plot(x, pooled_thr, linestyle=":", linewidth=2.0, label="3-session pooled Weibull threshold")
+        ax_thr.set_ylabel("threshold (deg; lower is better)")
+        ax_thr.set_xlabel("session")
+        ax_thr.set_xticks(x)
+        ax_thr.set_xticklabels(dates, rotation=45, ha="right", fontsize=8)
+        for xi, yi, nt in zip(x, thresholds, ntr):
+            if np.isfinite(yi):
+                ax_thr.annotate(f"n={nt}", (xi, yi), textcoords="offset points", xytext=(0, 6), ha="center", fontsize=7)
+
+        ax_acc = ax_thr.twinx()
+        ax_acc.plot(x, acc, marker="s", linewidth=1.2, label="raw accuracy (%)")
+        ax_acc.plot(x, rolling_mean(acc, 3), linestyle=":", linewidth=1.6, label="3-session mean accuracy")
+        ax_acc.set_ylabel("accuracy (%; higher is better)")
+        ax_acc.set_ylim(0, 100)
+        ax_acc.set_yticks(np.arange(0, 101, 10))
+
+        lines, labels = ax_thr.get_legend_handles_labels()
+        lines2, labels2 = ax_acc.get_legend_handles_labels()
+        ax_thr.legend(lines + lines2, labels + labels2, loc="best", fontsize=8)
+    ax_thr.set_title(f"FDD longitudinal dashboard - {location_id} (n={len(valid)} sessions)")
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=150)
+    plt.close(fig)
+    return out_png
+
+
+def save_block_accuracy_recent_plot(location_id, sessions, out_dir):
+    valid = [s for s in sessions if s.get("timestamp") is not None]
+    valid = sorted(valid, key=lambda s: s["timestamp"])[-RECENT_SESSION_WINDOW:]
+    out_png = make_writable_output_path(os.path.join(out_dir, f"recent_{location_id}_within_session_block_accuracy.png"))
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    block_matrix = []
+    labels = []
+    for s in valid:
+        blocks = s.get("block_accuracy", [])
+        vals = np.full(N_BLOCKS_WITHIN_SESSION, np.nan)
+        for b in blocks:
+            idx = int(b["block"]) - 1
+            if 0 <= idx < N_BLOCKS_WITHIN_SESSION:
+                vals[idx] = b["accuracy_percent"]
+        block_matrix.append(vals)
+        labels.append(datetime.strptime(s["timestamp"], "%Y-%m-%d %H:%M:%S").strftime("%m-%d %H:%M"))
+        ax.plot(np.arange(1, N_BLOCKS_WITHIN_SESSION + 1), vals, marker="o", linewidth=1.0, alpha=0.65, label=labels[-1])
+
+    if block_matrix:
+        arr = np.vstack(block_matrix)
+        mean_vals = np.nanmean(arr, axis=0)
+        ax.plot(np.arange(1, N_BLOCKS_WITHIN_SESSION + 1), mean_vals, marker="s", linewidth=2.4, label=f"mean of last {len(block_matrix)} sessions")
+
+    ax.set_xlabel(f"within-session block ({N_BLOCKS_WITHIN_SESSION} equal trial groups)")
+    ax.set_ylabel("accuracy (%)")
+    ax.set_ylim(0, 100)
+    ax.set_yticks(np.arange(0, 101, 10))
+    ax.set_title(f"Within-session raw accuracy, recent sessions - {location_id}")
+    ax.legend(fontsize=8, loc="best")
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=150)
+    plt.close(fig)
+    return out_png
+
+
+def save_stimulus_class_plot(location_id, sessions, out_dir):
+    valid = [s for s in sessions if s.get("timestamp") is not None]
+    valid = sorted(valid, key=lambda s: s["timestamp"])
+    out_png = make_writable_output_path(os.path.join(out_dir, f"longitudinal_{location_id}_stimulus_class_accuracy.png"))
+
+    # Collect all classes observed.
+    all_classes = []
+    for s in valid:
+        for row in s.get("stimulus_class_accuracy", []):
+            cls = row.get("stimulus_class", "unknown")
+            if cls not in all_classes:
+                all_classes.append(cls)
+    preferred = [c for c in ["UP", "DOWN", "LEFT", "RIGHT", "tilt +", "tilt -", "unknown"] if c in all_classes]
+    classes = preferred if preferred else all_classes
+
+    fig, ax = plt.subplots(figsize=(13, 5))
+    if valid and classes:
+        x = np.arange(1, len(valid) + 1)
+        dates = [datetime.strptime(s["timestamp"], "%Y-%m-%d %H:%M:%S").strftime("%m-%d\n%H:%M") for s in valid]
+        for cls in classes:
+            vals = []
+            for s in valid:
+                found = np.nan
+                for row in s.get("stimulus_class_accuracy", []):
+                    if row.get("stimulus_class") == cls:
+                        found = row.get("accuracy_percent", np.nan)
+                        break
+                vals.append(found)
+            ax.plot(x, vals, marker="o", linewidth=1.2, label=cls)
+        ax.set_xticks(x)
+        ax.set_xticklabels(dates, rotation=45, ha="right", fontsize=8)
+        ax.legend(fontsize=8, loc="best")
+    ax.set_xlabel("session")
+    ax.set_ylabel("accuracy (%)")
+    ax.set_ylim(0, 100)
+    ax.set_yticks(np.arange(0, 101, 10))
+    ax.set_title(f"Stimulus-class raw accuracy - {location_id}")
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=150)
+    plt.close(fig)
+    return out_png
+
+
+def save_summary_csv(session_results, out_dir):
+    rows = []
+    for s in session_results:
+        rows.append({
+            "timestamp": s.get("timestamp"),
+            "source_csv": s.get("source_csv"),
+            "location_id": s.get("location_id"),
+            "n_trials": s.get("n_trials"),
+            "n_unique_levels": s.get("n_unique_levels"),
+            "accuracy_percent": s.get("accuracy_percent"),
+            "fit_valid": s.get("fit_valid"),
+            "fit_failure_reason": s.get("fit_failure_reason"),
+            "threshold_deg": s.get("threshold_deg"),
+            "fit_pseudo_r2": s.get("fit_pseudo_r2"),
+            "fit_log_likelihood": s.get("fit_log_likelihood"),
+            "fit_aic": s.get("fit_aic"),
+            "fit_bic": s.get("fit_bic"),
+            "coarse_session_staircase_estimate_deg": s.get("coarse_session_staircase_estimate_deg"),
+            "angle_set": s.get("angle_set"),
+        })
+    out_csv = make_writable_output_path(os.path.join(out_dir, "session_summary_table.csv"))
+    pd.DataFrame(rows).to_csv(out_csv, index=False)
+    return out_csv
+
+
+
+def _relpath_for_html(path, base_dir):
+    if path is None:
+        return None
+    try:
+        return os.path.relpath(path, base_dir).replace(os.sep, "/")
+    except Exception:
+        return str(path).replace(os.sep, "/")
+
+
+def _safe_anchor(text):
+    return re.sub(r'[^A-Za-z0-9_-]+', '_', str(text or 'section'))
+
+
+def generate_html_dashboard(longitudinal, out_dir):
+    """Generate a single navigable HTML dashboard and return its path.
+
+    V8 additions:
+    - browser-based Export to PDF button via window.print();
+    - interactive session-comparison workspace per location;
+    - selected sessions can be overlaid as Weibull curves, without overlaying staircase traces.
+    """
+    out_dir = os.path.abspath(out_dir)
+    dashboard_path = make_writable_output_path(os.path.join(out_dir, "dashboard.html"))
+
+    def esc(x):
+        return html.escape("" if x is None else str(x))
+
+    # Minimal data payload for client-side comparison plotting.
+    comparison_payload = {"locations": {}}
+    for location_id, loc in longitudinal.get("locations", {}).items():
+        sorted_sessions = sorted(loc.get("sessions", []), key=lambda s: (s.get("timestamp") is None, s.get("timestamp") or ""))
+        pooled_vals = loc.get("pooled_3session_thresholds_deg", []) or []
+        comparison_payload["locations"][location_id] = []
+        for idx, s in enumerate(sorted_sessions, 1):
+            pooled_v = pooled_vals[idx-1] if idx-1 < len(pooled_vals) else None
+            comparison_payload["locations"][location_id].append({
+                "index": idx,
+                "timestamp": s.get("timestamp"),
+                "source_csv": s.get("source_csv"),
+                "fit_valid": bool(s.get("fit_valid")),
+                "alpha_log": s.get("alpha_log"),
+                "beta": s.get("beta"),
+                "threshold_deg": s.get("threshold_deg"),
+                "pooled_3session_threshold_deg": pooled_v,
+                "accuracy_percent": s.get("accuracy_percent"),
+                "percent_correct_table": s.get("percent_correct_table", []),
+            })
+
+    nav_items = ['<a href="#summary">Summary</a>']
+    sections = []
+    css = """
+    :root {
+      --bg: #f7f7f7;
+      --panel: #ffffff;
+      --ink: #222;
+      --muted: #666;
+      --border: #d8d8d8;
+      --accent: #0b57d0;
+    }
+    body { font-family: Arial, sans-serif; margin: 0; background: var(--bg); color: var(--ink); }
+    header { position: sticky; top: 0; background: #111; color: white; padding: 14px 22px; z-index: 10; }
+    header h1 { margin: 0 0 8px 0; font-size: 20px; }
+    nav { line-height: 1.7; max-height: 82px; overflow-y: auto; }
+    nav a { color: #d8e6ff; margin-right: 14px; text-decoration: none; font-size: 13px; }
+    main { padding: 24px; max-width: 1500px; margin: auto; }
+    section { background: var(--panel); border-radius: 8px; padding: 20px; margin-bottom: 24px; box-shadow: 0 1px 4px rgba(0,0,0,0.12); }
+    h2 { margin-top: 0; border-bottom: 1px solid #ddd; padding-bottom: 8px; break-after: avoid; page-break-after: avoid; }
+    h3 { margin-top: 22px; break-after: avoid; page-break-after: avoid; }
+    button { border: 1px solid #999; background: #f4f4f4; padding: 7px 10px; border-radius: 5px; cursor: pointer; margin: 3px; }
+    button:hover { background: #e9eef8; }
+    input[type="color"] { width: 30px; height: 22px; padding: 0; vertical-align: middle; border: 1px solid #aaa; background: white; }
+    .meta { color: var(--muted); font-size: 13px; margin-bottom: 14px; }
+    img { max-width: 100%; height: auto; border: 1px solid var(--border); background: white; }
+    table { border-collapse: collapse; width: 100%; font-size: 13px; margin-top: 12px; }
+    th, td { border: 1px solid #ddd; padding: 6px 8px; text-align: left; }
+    th { background: #eee; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(440px, 1fr)); gap: 18px; }
+    .session-card { border: 1px solid #ddd; border-radius: 6px; padding: 12px; background: #fafafa; break-inside: avoid; page-break-inside: avoid; }
+    .small { font-size: 12px; color: var(--muted); }
+    .toplink { float: right; font-size: 12px; }
+    .toolbar { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin: 10px 0 15px; }
+    .print-button { background:var(--accent); color:white; border-color:var(--accent); font-weight:bold; }
+    .compare-layout { display: grid; grid-template-columns: minmax(290px, 390px) 1fr; gap: 18px; align-items: start; }
+    .session-selector { max-height: 430px; overflow-y: auto; border: 1px solid #ddd; padding: 10px; background: #fbfbfb; }
+    .session-selector label { display:block; padding:4px 0; font-size:12px; }
+    canvas { width: 100%; max-width: 980px; border: 1px solid #ddd; background: white; }
+    .note { background:#fff9db; border:1px solid #e5d27a; padding:10px; border-radius:6px; font-size:13px; }
+    .figure-block { break-inside: avoid; page-break-inside: avoid; margin-bottom: 18px; }
+    .figure-block h3 { margin-top: 0; }
+    .interactive-panel { break-inside: avoid; page-break-inside: avoid; }
+    .checkbox-inline label { margin-right: 14px; white-space: nowrap; }
+    .print-only { display:none; }
+    @media print {
+      @page { size: A4 portrait; margin: 12mm; }
+      body { background: white; font-size: 10.5pt; }
+      header { position: static; background: white; color: #111; padding: 0 0 8mm 0; border-bottom: 1px solid #ccc; }
+      nav, .toolbar, .toplink, .session-selector, .interactive-only, button { display: none !important; }
+      .print-only { display:block; }
+      main { padding: 0; max-width: none; }
+      section { box-shadow: none; border: none; border-radius: 0; padding: 0; margin: 0 0 10mm 0; break-inside: auto; page-break-inside: auto; }
+      .figure-block, .session-card, table { break-inside: avoid; page-break-inside: avoid; }
+      .grid { display: block; }
+      .session-card { margin-bottom: 9mm; border: 1px solid #ddd; padding: 8mm; }
+      img { max-height: 160mm; width: auto; max-width: 100%; }
+      canvas { max-height: 150mm; max-width: 100%; }
+      h1, h2, h3 { break-after: avoid; page-break-after: avoid; }
+    }
+    """
+    summary_rel = _relpath_for_html(longitudinal.get("summary_csv"), out_dir) if longitudinal.get("summary_csv") else None
+    sections.append(
+        '<section id="summary">'
+        '<h2>Analysis summary</h2>'
+        '<div class="toolbar"><button class="print-button" onclick="window.print()">Export / print as PDF</button></div>'
+        f'<div class="meta">Sessions analysed: {esc(longitudinal.get("n_sessions_total"))}. '
+        f'Constants: chance={CHANCE}, lapse={LAPSE_RATE}, threshold target={THRESHOLD_TARGET}. Descriptive dashboard only.</div>'
+        '<div class="note">The PDF export uses the browser print dialog. Choose “Save as PDF” as the printer. This avoids adding a non-standard PDF dependency to the analysis code.</div>'
+        + (f'<p><a href="{esc(summary_rel)}">Open session_summary_table.csv</a></p>' if summary_rel else '')
+        + '</section>'
+    )
+
+    for location_id, loc in longitudinal.get("locations", {}).items():
+        loc_anchor = _safe_anchor(location_id)
+        nav_items.append(f'<a href="#loc_{esc(loc_anchor)}">{esc(location_id)}</a>')
+        overlay = _relpath_for_html(loc.get("accuracy_threshold_overlay_png"), out_dir)
+        block = _relpath_for_html(loc.get("recent_block_accuracy_png"), out_dir)
+        stim = _relpath_for_html(loc.get("stimulus_class_accuracy_png"), out_dir)
+
+        sorted_sessions = sorted(loc.get("sessions", []), key=lambda s: (s.get("timestamp") is None, s.get("timestamp") or ""))
+        rows = []
+        cards = []
+        checkbox_html = []
+        for idx, s in enumerate(sorted_sessions, 1):
+            sess_anchor = f"{loc_anchor}_session_{idx}"
+            if idx <= 20 or idx > max(20, len(sorted_sessions)-5):
+                nav_items.append(f'<a href="#{esc(sess_anchor)}">S{idx}</a>')
+            acc_txt = "" if s.get("accuracy_percent") is None else f'{s.get("accuracy_percent"):.2f}'
+            thr_txt = "" if s.get("threshold_deg") is None else f'{s.get("threshold_deg"):.2f}'
+            fit_ok = bool(s.get("fit_valid"))
+            rows.append(
+                '<tr>'
+                f'<td><a href="#{esc(sess_anchor)}">{idx}</a></td>'
+                f'<td>{esc(s.get("timestamp"))}</td>'
+                f'<td>{esc(s.get("source_csv"))}</td>'
+                f'<td>{esc(s.get("n_trials"))}</td>'
+                f'<td>{acc_txt}</td>'
+                f'<td>{thr_txt}</td>'
+                f'<td>{esc(s.get("fit_valid"))}</td>'
+                f'<td>{esc(s.get("fit_failure_reason"))}</td>'
+                '</tr>'
+            )
+            disabled = '' if fit_ok else ' disabled'
+            checked = ' checked' if fit_ok and (idx in [1, len(sorted_sessions)] or idx > max(0, len(sorted_sessions)-2)) else ''
+            default_color = ['#1f77b4', '#d62728', '#2ca02c', '#9467bd', '#ff7f0e', '#17becf', '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22'][(idx-1) % 10]
+            color_disabled = '' if fit_ok else ' disabled'
+            checkbox_html.append(
+                f'<label><input type="checkbox" class="cmp-{esc(loc_anchor)}" value="{idx-1}"{checked}{disabled} onchange="renderComparison(\'{esc(location_id)}\', \'{esc(loc_anchor)}\')"> '
+                f'<input type="color" class="color-{esc(loc_anchor)}" data-index="{idx-1}" value="{default_color}"{color_disabled} onchange="renderComparison(\'{esc(location_id)}\', \'{esc(loc_anchor)}\')"> '
+                f'S{idx} — {esc(s.get("timestamp"))} — acc={acc_txt}% — thr={thr_txt}°</label>'
+            )
+            psych = _relpath_for_html(s.get("psychometric_plot_png"), out_dir)
+            stair = _relpath_for_html(s.get("staircase_plot_png"), out_dir)
+            dist = _relpath_for_html(s.get("distribution_plot_png"), out_dir)
+            cards.append(
+                f'<div class="session-card" id="{esc(sess_anchor)}">'
+                '<a class="toplink" href="#summary">top</a>'
+                f'<h3>Session {idx}: {esc(s.get("timestamp"))}</h3>'
+                f'<div class="small">{esc(s.get("source_csv"))} | trials={esc(s.get("n_trials"))} | accuracy={acc_txt}% | threshold={thr_txt}° | fit={esc(s.get("fit_valid"))}</div>'
+                '<p><strong>Psychometric Weibull</strong></p>'
+                + (f'<img src="{esc(psych)}" alt="psychometric plot">' if psych else '<p>No psychometric plot.</p>')
+                + '<p><strong>Staircase trace</strong></p>'
+                + (f'<img src="{esc(stair)}" alt="staircase plot">' if stair else '<p>No staircase plot.</p>')
+                + '<p><strong>Stimulus-level distribution</strong></p>'
+                + (f'<img src="{esc(dist)}" alt="stimulus distribution">' if dist else '<p>No distribution plot.</p>')
+                + '</div>'
+            )
+
+        sections.append(
+            f'<section id="loc_{esc(loc_anchor)}">'
+            '<a class="toplink" href="#summary">top</a>'
+            f'<h2>Location {esc(location_id)}</h2>'
+            f'<div class="meta">Sessions: {esc(loc.get("n_sessions"))}; valid Weibull fits: {esc(loc.get("n_valid_fits"))}.</div>'
+            '<div class="figure-block interactive-panel">'
+            '<h3>Interactive longitudinal view</h3>'
+            '<div class="note">Use the checkboxes to show raw data and light smoothing. The original static raw figure remains available below.</div>'
+            '<div class="toolbar checkbox-inline interactive-only">'
+            + f'<label><input type="checkbox" id="raw_{esc(loc_anchor)}" checked onchange="renderLongitudinal(\'{esc(location_id)}\', \'{esc(loc_anchor)}\')"> raw data</label>'
+            + f'<label><input type="checkbox" id="ma5_{esc(loc_anchor)}" checked onchange="renderLongitudinal(\'{esc(location_id)}\', \'{esc(loc_anchor)}\')"> moving average 5</label>'
+            + f'<label><input type="checkbox" id="ma10_{esc(loc_anchor)}" onchange="renderLongitudinal(\'{esc(location_id)}\', \'{esc(loc_anchor)}\')"> moving average 10</label>'
+            + f'<label><input type="checkbox" id="pooled_{esc(loc_anchor)}" checked onchange="renderLongitudinal(\'{esc(location_id)}\', \'{esc(loc_anchor)}\')"> 3-session pooled Weibull threshold</label>'
+            + '</div>'
+            + f'<canvas id="long_canvas_{esc(loc_anchor)}" width="1100" height="520"></canvas>'
+            + f'<div class="small" id="long_note_{esc(loc_anchor)}"></div>'
+            '</div>'
+            '<div class="figure-block print-only">'
+            '<h3>Static longitudinal reference</h3>'
+            + (f'<img src="{esc(overlay)}" alt="longitudinal overlay">' if overlay else '<p>No overlay plot.</p>')
+            + '</div>'
+            '<div class="figure-block">'
+            '<h3>Within-session block accuracy, recent sessions</h3>'
+            + (f'<img src="{esc(block)}" alt="block accuracy">' if block else '<p>No block plot.</p>')
+            + '</div>'
+            '<div class="figure-block">'
+            '<h3>Stimulus-class accuracy</h3>'
+            + (f'<img src="{esc(stim)}" alt="stimulus class">' if stim else '<p>No stimulus-class plot.</p>')
+            + '</div>'
+            + '<div class="figure-block interactive-panel">'
+            + '<h3>Compare sessions: overlaid Weibull curves</h3>'
+            + '<div class="note">Select sessions below to overlay fitted Weibull curves and observed psychometric points. Use the colour selectors to compare older and newer sessions. Staircase traces are kept session-by-session because they become visually dense when overlaid.</div>'
+            + '<div class="toolbar interactive-only">'
+            + f'<button onclick="selectComparison(\'{esc(loc_anchor)}\', \'none\'); renderComparison(\'{esc(location_id)}\', \'{esc(loc_anchor)}\')">Clear</button>'
+            + f'<button onclick="selectComparison(\'{esc(loc_anchor)}\', \'recent\'); renderComparison(\'{esc(location_id)}\', \'{esc(loc_anchor)}\')">Select recent 5</button>'
+            + f'<button onclick="selectComparison(\'{esc(loc_anchor)}\', \'firstlast\'); renderComparison(\'{esc(location_id)}\', \'{esc(loc_anchor)}\')">First + last</button>'
+            + '</div>'
+            + '<div class="compare-layout">'
+            + f'<div class="session-selector interactive-only">{"".join(checkbox_html)}</div>'
+            + f'<div><canvas id="canvas_{esc(loc_anchor)}" width="1000" height="560"></canvas><div class="small" id="cmp_note_{esc(loc_anchor)}"></div></div>'
+            + '</div>'
+            + '</div>'
+            + '<h3>Session table</h3>'
+            + '<table><thead><tr><th>#</th><th>Timestamp</th><th>CSV</th><th>Trials</th><th>Accuracy %</th><th>Threshold °</th><th>Fit valid</th><th>Fit note</th></tr></thead><tbody>'
+            + ''.join(rows)
+            + '</tbody></table></section>'
+            + f'<section><h2>Session-level plots — {esc(location_id)}</h2><div class="grid">'
+            + ''.join(cards)
+            + '</div></section>'
+        )
+
+    nav_html = "\n".join(nav_items)
+    payload_json = json.dumps(comparison_payload)
+    js = r'''
+    const DASHBOARD_DATA = __PAYLOAD__;
+    const CHANCE = 0.5;
+    const LAPSE = 0.05;
+    const TARGET = 0.725;
+    const DEFAULT_COLORS = ["#1f77b4", "#d62728", "#2ca02c", "#9467bd", "#ff7f0e", "#17becf", "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22"];
+    function weibull(x, alpha, beta) {
+      const xx = Math.max(x, 1e-9);
+      const aa = Math.max(alpha, 1e-9);
+      return CHANCE + (1.0 - CHANCE - LAPSE) * (1.0 - Math.exp(-Math.pow(xx / aa, beta)));
+    }
+    function log10(x) { return Math.log(x) / Math.LN10; }
+    function movingAverage(arr, windowSize) {
+      return arr.map((_, i) => {
+        const start = Math.max(0, i - windowSize + 1);
+        const vals = arr.slice(start, i + 1).filter(v => Number.isFinite(v));
+        if (!vals.length) return NaN;
+        return vals.reduce((a,b)=>a+b,0) / vals.length;
+      });
+    }
+    function drawLine(ctx, x1,y1,x2,y2){ ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke(); }
+    function safeAnchor(loc){ return loc.replace(/[^A-Za-z0-9_-]+/g, '_'); }
+    function checked(id) { const el = document.getElementById(id); return el ? el.checked : false; }
+
+    function selectedIndexes(anchor) {
+      return Array.from(document.querySelectorAll('.cmp-' + CSS.escape(anchor))).filter(x => x.checked && !x.disabled).map(x => parseInt(x.value));
+    }
+    function selectedColor(anchor, index, fallback) {
+      const el = document.querySelector('.color-' + CSS.escape(anchor) + '[data-index="' + index + '"]');
+      return el ? el.value : fallback;
+    }
+    function selectComparison(anchor, mode) {
+      const boxes = Array.from(document.querySelectorAll('.cmp-' + CSS.escape(anchor))).filter(x => !x.disabled);
+      boxes.forEach(b => b.checked = false);
+      if (mode === 'recent') boxes.slice(-5).forEach(b => b.checked = true);
+      if (mode === 'firstlast' && boxes.length) { boxes[0].checked = true; boxes[boxes.length-1].checked = true; }
+    }
+
+    function renderLongitudinal(locationId, anchor) {
+      const sessions = (DASHBOARD_DATA.locations[locationId] || []).filter(s => s.timestamp != null);
+      const canvas = document.getElementById('long_canvas_' + anchor);
+      const note = document.getElementById('long_note_' + anchor);
+      if (!canvas) return;
+      const ctx = canvas.getContext('2d');
+      ctx.clearRect(0,0,canvas.width,canvas.height);
+      ctx.font = '13px Arial';
+      const W = canvas.width, H = canvas.height;
+      const m = {l:65, r:65, t:35, b:75};
+      if (!sessions.length) { ctx.fillText('No longitudinal data.', m.l, m.t); return; }
+      const thr = sessions.map(s => (s.fit_valid && s.threshold_deg != null) ? Number(s.threshold_deg) : NaN);
+      const acc = sessions.map(s => s.accuracy_percent != null ? Number(s.accuracy_percent) : NaN);
+      const pooled = sessions.map(s => s.pooled_3session_threshold_deg != null ? Number(s.pooled_3session_threshold_deg) : NaN);
+      const thrMA5 = movingAverage(thr, 5);
+      const thrMA10 = movingAverage(thr, 10);
+      const accMA5 = movingAverage(acc, 5);
+      const showRaw = checked('raw_' + anchor);
+      const showMA5 = checked('ma5_' + anchor);
+      const showMA10 = checked('ma10_' + anchor);
+      const showPooled = checked('pooled_' + anchor);
+
+      const maxThr = Math.max(...thr.concat(pooled, thrMA5, thrMA10).filter(Number.isFinite), 10);
+      const yThrMax = Math.max(10, Math.ceil(maxThr / 10) * 10);
+      function X(i){ return m.l + (i - 1) / Math.max(1, sessions.length - 1) * (W - m.l - m.r); }
+      function Ythr(v){ return H - m.b - (v / yThrMax) * (H - m.t - m.b); }
+      function Yacc(v){ return H - m.b - (v / 100) * (H - m.t - m.b); }
+
+      ctx.strokeStyle = '#333'; ctx.lineWidth = 1;
+      drawLine(ctx, m.l, H-m.b, W-m.r, H-m.b);
+      drawLine(ctx, m.l, m.t, m.l, H-m.b);
+      drawLine(ctx, W-m.r, m.t, W-m.r, H-m.b);
+      ctx.fillStyle = '#333';
+      for (let y=0; y<=yThrMax; y+=Math.max(10, yThrMax/5)) {
+        const yy = Ythr(y);
+        ctx.strokeStyle = '#eee'; drawLine(ctx, m.l, yy, W-m.r, yy);
+        ctx.fillStyle = '#333'; ctx.fillText(String(Math.round(y)), 18, yy+4);
+      }
+      for (let y=0; y<=100; y+=20) {
+        const yy = Yacc(y);
+        ctx.fillStyle = '#666'; ctx.fillText(String(y), W-m.r+10, yy+4);
+      }
+      const step = Math.max(1, Math.ceil(sessions.length / 12));
+      for (let i=1; i<=sessions.length; i+=step) {
+        const xx = X(i);
+        ctx.strokeStyle = '#ddd'; drawLine(ctx, xx, H-m.b, xx, H-m.b+5);
+        ctx.save(); ctx.translate(xx-8, H-m.b+12); ctx.rotate(-Math.PI/4);
+        ctx.fillStyle = '#333'; ctx.fillText('S' + i, 0, 0); ctx.restore();
+      }
+      ctx.fillStyle = '#333';
+      ctx.fillText('threshold (deg; lower is better)', 8, 20);
+      ctx.fillText('accuracy (%)', W-m.r-20, 20);
+
+      function plotSeries(vals, color, yfn, dash, width, marker) {
+        ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = width || 2;
+        ctx.setLineDash(dash || []);
+        let started = false; ctx.beginPath();
+        vals.forEach((v, idx) => {
+          if (!Number.isFinite(v)) { started = false; return; }
+          const xx = X(idx+1), yy = yfn(v);
+          if (!started) { ctx.moveTo(xx, yy); started = true; } else ctx.lineTo(xx, yy);
+        });
+        ctx.stroke(); ctx.setLineDash([]);
+        if (marker) {
+          vals.forEach((v, idx) => {
+            if (!Number.isFinite(v)) return;
+            ctx.beginPath(); ctx.arc(X(idx+1), yfn(v), 3, 0, Math.PI*2); ctx.fill();
+          });
+        }
+      }
+      if (showRaw) {
+        plotSeries(thr, '#1f77b4', Ythr, [], 1.6, true);
+        plotSeries(acc, '#d62728', Yacc, [], 1.3, true);
+      }
+      if (showMA5) {
+        plotSeries(thrMA5, '#003f8c', Ythr, [7,4], 2.0, false);
+        plotSeries(accMA5, '#8c1f13', Yacc, [7,4], 2.0, false);
+      }
+      if (showMA10) {
+        plotSeries(thrMA10, '#6baed6', Ythr, [2,4], 2.0, false);
+      }
+      if (showPooled) {
+        plotSeries(pooled, '#2ca02c', Ythr, [1,3], 2.4, false);
+      }
+
+      let legend = [];
+      if (showRaw) legend.push(['#1f77b4','raw threshold'], ['#d62728','raw accuracy']);
+      if (showMA5) legend.push(['#003f8c','MA5 threshold'], ['#8c1f13','MA5 accuracy']);
+      if (showMA10) legend.push(['#6baed6','MA10 threshold']);
+      if (showPooled) legend.push(['#2ca02c','3-session pooled threshold']);
+      legend.forEach((item, idx) => {
+        ctx.fillStyle = item[0]; ctx.fillRect(m.l + 10, m.t + 8 + idx*18, 12, 12);
+        ctx.fillStyle = '#333'; ctx.fillText(item[1], m.l + 28, m.t + 19 + idx*18);
+      });
+      const finiteThr = thr.filter(Number.isFinite);
+      const finiteAcc = acc.filter(Number.isFinite);
+      const meanThr = finiteThr.length ? finiteThr.reduce((a,b)=>a+b,0)/finiteThr.length : NaN;
+      const meanAcc = finiteAcc.length ? finiteAcc.reduce((a,b)=>a+b,0)/finiteAcc.length : NaN;
+      const sdThr = finiteThr.length ? Math.sqrt(finiteThr.map(v => Math.pow(v - meanThr, 2)).reduce((a,b)=>a+b,0)/finiteThr.length) : NaN;
+      const sdAcc = finiteAcc.length ? Math.sqrt(finiteAcc.map(v => Math.pow(v - meanAcc, 2)).reduce((a,b)=>a+b,0)/finiteAcc.length) : NaN;
+      if(note) note.textContent = `Sessions: ${sessions.length}. SD threshold: ${Number.isFinite(sdThr) ? sdThr.toFixed(2) + '°' : 'n/a'}; SD accuracy: ${Number.isFinite(sdAcc) ? sdAcc.toFixed(2) + '%' : 'n/a'}. Raw data remain visible when the raw-data box is selected.`;
+    }
+
+    function renderComparison(locationId, anchor) {
+      const sessions = DASHBOARD_DATA.locations[locationId] || [];
+      const selected = selectedIndexes(anchor).map(i => sessions[i]).filter(s => s && s.fit_valid && s.alpha_log != null && s.beta != null);
+      const canvas = document.getElementById('canvas_' + anchor);
+      const note = document.getElementById('cmp_note_' + anchor);
+      if (!canvas) return;
+      const ctx = canvas.getContext('2d');
+      ctx.clearRect(0,0,canvas.width,canvas.height);
+      ctx.font = '13px Arial';
+      const W = canvas.width, H = canvas.height;
+      const m = {l:70, r:25, t:35, b:70};
+      if (!selected.length) { ctx.fillText('Select one or more valid sessions.', m.l, m.t); if(note) note.textContent=''; return; }
+      let xVals = [];
+      selected.forEach(s => (s.percent_correct_table || []).forEach(p => xVals.push(log10((p.angle_deg || 0) + 1))));
+      if (!xVals.length) { xVals = [0, 2]; }
+      let xmin = Math.min(...xVals), xmax = Math.max(...xVals);
+      xmin = Math.max(0, xmin - 0.03); xmax = xmax + 0.03;
+      if (xmax <= xmin) xmax = xmin + 1;
+      function X(x){ return m.l + (x - xmin) / (xmax - xmin) * (W - m.l - m.r); }
+      function Y(p){ return H - m.b - p * (H - m.t - m.b); }
+      ctx.strokeStyle = '#333'; ctx.lineWidth = 1;
+      drawLine(ctx, m.l, H-m.b, W-m.r, H-m.b); drawLine(ctx, m.l, m.t, m.l, H-m.b);
+      ctx.fillStyle = '#333';
+      for (let y=0; y<=100; y+=10){ const yy=Y(y/100); ctx.strokeStyle='#eee'; drawLine(ctx,m.l,yy,W-m.r,yy); ctx.fillStyle='#333'; ctx.fillText(String(y), 25, yy+4); }
+      ctx.fillText('percent correct (%)', 8, 22);
+      const degTicks = [0.5,0.8,1.2,2,3.2,5.1,8.1,12.97,20.75,33.2,53.1,85,90];
+      degTicks.forEach(d => { const x=log10(d+1); if (x>=xmin && x<=xmax){ const xx=X(x); ctx.strokeStyle='#ddd'; drawLine(ctx,xx,H-m.b,xx,H-m.b+5); ctx.fillStyle='#333'; ctx.fillText(String(d), xx-8, H-m.b+22); }});
+      ctx.fillText('angle difference (deg)', W/2-70, H-18);
+      ctx.fillText('log10(angle + 1) is used internally for the fit', W/2-120, H-2);
+      selected.forEach((s, idx) => {
+        const color = selectedColor(anchor, s.index - 1, DEFAULT_COLORS[idx % DEFAULT_COLORS.length]);
+        ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = 2;
+        let first = true; ctx.beginPath();
+        for (let k=0; k<=220; k++){
+          const x = xmin + (xmax-xmin)*k/220;
+          const p = weibull(x, s.alpha_log, s.beta);
+          const xx = X(x), yy = Y(p);
+          if(first){ ctx.moveTo(xx,yy); first=false; } else ctx.lineTo(xx,yy);
+        }
+        ctx.stroke();
+        (s.percent_correct_table || []).forEach(p => {
+          const x = log10((p.angle_deg || 0)+1), y=(p.proportion_correct != null ? p.proportion_correct : (p.percent_correct || 0)/100);
+          ctx.beginPath(); ctx.arc(X(x), Y(y), Math.max(3, Math.min(9, Math.sqrt(p.n || 1)*1.5)), 0, Math.PI*2); ctx.fill();
+        });
+        const label = `S${s.index} ${s.timestamp || ''} | acc=${Number(s.accuracy_percent).toFixed(1)}% | thr=${Number(s.threshold_deg).toFixed(1)}°`;
+        ctx.fillText(label, m.l+8, m.t + 18 + idx*18);
+      });
+      if(note) note.textContent = `${selected.length} session(s) selected. Curves are fitted Weibull functions; dots are observed percent-correct by stimulus level.`;
+    }
+    window.addEventListener('load', () => {
+      Object.keys(DASHBOARD_DATA.locations || {}).forEach(loc => {
+        const anchor = safeAnchor(loc);
+        renderLongitudinal(loc, anchor);
+        renderComparison(loc, anchor);
+      });
+    });
+    '''.replace('__PAYLOAD__', payload_json)
+    body = (
+        '<!doctype html><html lang="en"><head><meta charset="utf-8">'
+        '<title>Huxlin FBA Analysis Dashboard</title>'
+        f'<style>{css}</style></head><body>'
+        '<header><h1>Huxlin FBA Analysis Dashboard</h1><nav>'
+        + nav_html
+        + '</nav></header><main>'
+        + ''.join(sections)
+        + f'<script>{js}</script>'
+        + '</main></body></html>'
+    )
+    with open(dashboard_path, "w", encoding="utf-8") as f:
+        f.write(body)
+    return dashboard_path
+def open_dashboard(path):
+    try:
+        webbrowser.open("file://" + os.path.abspath(path))
+    except Exception:
+        pass
+def main():
+    csv_paths = discover_csvs()
+    if not csv_paths:
+        print("No *_trials.csv files found.")
+        return
+
+    out_dir = output_directory_for(csv_paths)
+    os.makedirs(out_dir, exist_ok=True)
+
+    session_results = []
+    for csv_path in sorted(csv_paths):
+        try:
+            res = fit_session(csv_path)
+        except Exception as e:
+            ts = parse_timestamp_from_name(csv_path)
+            res = {
+                "source_csv": os.path.basename(csv_path),
+                "source_csv_abs": os.path.abspath(csv_path),
+                "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S") if ts else None,
+                "location_id": infer_location_id(csv_path)[0],
+                "fit_valid": False,
+                "fit_failure_reason": f"analysis_exception: {repr(e)}",
+                "n_trials": None,
+                "n_unique_levels": None,
+                "accuracy_percent": None,
+                "percent_correct_table": [],
+                "block_accuracy": [],
+                "stimulus_class_accuracy": [],
+            }
+        psych_png, session_json = save_session_plot(res, out_dir)
+        stair_png = save_staircase_plot(res, out_dir)
+        dist_png = save_distribution_plot(res, out_dir)
+        res["psychometric_plot_png"] = os.path.abspath(psych_png)
+        res["staircase_plot_png"] = os.path.abspath(stair_png) if stair_png else None
+        res["distribution_plot_png"] = os.path.abspath(dist_png) if dist_png else None
+        res["session_json_output"] = os.path.abspath(session_json)
+        session_results.append(res)
+
+    grouped = defaultdict(list)
+    for res in session_results:
+        grouped[res["location_id"]].append(res)
+
+    summary_csv = save_summary_csv(session_results, out_dir)
+
+    longitudinal = {
+        "source_lineage": "TrainingCodes + DataFitting-compatible per-session fitting; descriptive dashboard additions only; V7 adds fit likelihood metrics, stimulus-level distributions, pooled 3-session thresholds, and variability summaries",
+        "constants": {
+            "thresholdTarget": THRESHOLD_TARGET,
+            "lapse_rate": LAPSE_RATE,
+            "chance": CHANCE,
+            "within_session_blocks": N_BLOCKS_WITHIN_SESSION,
+            "recent_session_window": RECENT_SESSION_WINDOW,
+            "pooled_threshold_window": 3,
+        },
+        "n_sessions_total": len(session_results),
+        "summary_csv": os.path.abspath(summary_csv),
+        "locations": {},
+    }
+
+    for location_id, sessions in grouped.items():
+        sessions_sorted = sorted(sessions, key=lambda s: (s.get("timestamp") is None, s.get("timestamp") or ""))
+        overlay_png = save_longitudinal_overlay_plot(location_id, sessions_sorted, out_dir)
+        block_png = save_block_accuracy_recent_plot(location_id, sessions_sorted, out_dir)
+        class_png = save_stimulus_class_plot(location_id, sessions_sorted, out_dir)
+        valid_for_stats = [s for s in sessions_sorted if s.get("timestamp") is not None]
+        thresholds_for_stats = np.array([s.get("threshold_deg", np.nan) if s.get("fit_valid") else np.nan for s in valid_for_stats], dtype=float)
+        acc_for_stats = np.array([s.get("accuracy_percent", np.nan) for s in valid_for_stats], dtype=float)
+        pooled_for_stats = pooled_thresholds_by_window(valid_for_stats, window=3) if valid_for_stats else np.array([], dtype=float)
+        longitudinal["locations"][location_id] = {
+            "n_sessions": len(sessions_sorted),
+            "n_valid_fits": sum(1 for s in sessions_sorted if s.get("fit_valid")),
+            "variability": {
+                "threshold_std_deg": float(np.nanstd(thresholds_for_stats)) if np.isfinite(thresholds_for_stats).any() else None,
+                "accuracy_std_percent": float(np.nanstd(acc_for_stats)) if np.isfinite(acc_for_stats).any() else None,
+                "pooled_3session_threshold_std_deg": float(np.nanstd(pooled_for_stats)) if np.isfinite(pooled_for_stats).any() else None,
+            },
+            "pooled_3session_thresholds_deg": [None if not np.isfinite(v) else float(v) for v in pooled_for_stats],
+            "accuracy_threshold_overlay_png": os.path.abspath(overlay_png),
+            "recent_block_accuracy_png": os.path.abspath(block_png),
+            "stimulus_class_accuracy_png": os.path.abspath(class_png),
+            "sessions": sessions_sorted,
+        }
+
+    long_json = make_writable_output_path(os.path.join(out_dir, "analysis_dashboard_summary.json"))
+    with open(long_json, "w", encoding="utf-8") as f:
+        json.dump(longitudinal, f, indent=2)
+
+    dashboard_html = generate_html_dashboard(longitudinal, out_dir)
+    open_dashboard(dashboard_html)
+
+    print(json.dumps({
+        "n_sessions_total": len(session_results),
+        "output_directory": os.path.abspath(out_dir),
+        "dashboard_html": os.path.abspath(dashboard_html),
+        "dashboard_json": os.path.abspath(long_json),
+        "summary_csv": os.path.abspath(summary_csv),
+        "locations": {k: {"n_sessions": v["n_sessions"], "n_valid_fits": v["n_valid_fits"]}
+                      for k, v in longitudinal["locations"].items()}
+    }, indent=2))
+
+
+if __name__ == "__main__":
+    main()
