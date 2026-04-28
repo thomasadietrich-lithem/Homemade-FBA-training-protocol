@@ -792,7 +792,7 @@ Recommended references:
 3. Cavanaugh, M. R., Barbot, A., Carrasco, M., & Huxlin, K. R. (2019).  
    **Feature-based attention potentiates recovery of fine direction discrimination in cortically blind patients.**  
    *Neuropsychologia, 128, 315–324.*  
-   https://doi.org/10.1016/j.neuropsychologia.2017.12.010
+   https://doi.org/10.1016/j.neuropsychologia.2017.12.010](https://pmc.ncbi.nlm.nih.gov/articles/PMC5994362/)
 
 Public Huxlin Lab GitHub organization:
 
