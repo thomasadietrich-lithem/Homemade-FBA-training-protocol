@@ -1,0 +1,3229 @@
+"""
+Standalone PsychoPy implementation of a Huxlin-lab-inspired home training task for
+fine direction discrimination (FDD) of a coherent-motion random-dot stimulus with a
+feature-based attention (FBA) pre-cue.
+
+VERSION 2.0 -- Revision consolidee suite a l'audit scientifique comparatif avec le
+code MATLAB/Psychtoolbox d'origine (huxlinlab/TrainingCodes, fichiers
+HuxlinLabFBASetup.m + HuxlinLabFBAtraining.m).
+
+Design choices in this version
+-------------------------------
+- Bilingue FR/EN, francais par defaut, choisi au premier lancement et memorise.
+- Configuration en UNE seule fenetre (`_ask_full_settings`), organisee en sections
+  visuelles (Consignes / Utilisateur / Parametres de l'ecran / Parametre de
+  l'exercice / Parametres du stimulus) via des `addText()` d'en-tete intercales
+  entre les champs, avec garde-fous obligatoires (resolution, taille physique,
+  position multi-ecran) et verification dynamique que le stimulus demande rentre
+  bien dans le champ visuel disponible. Aucune cascade d'ecrans successifs : toute
+  erreur de saisie ou de garde-fou rouvre cette meme fenetre, prefillee.
+- Anti-triche ecran : avertissement souple si la densite de pixels impliquee
+  par la resolution et la diagonale declarees est atypique d'un ecran externe
+  standard (`estimate_dpi` / `is_dpi_plausible`, voir note pres de
+  MIN_PLAUSIBLE_DPI), complete par une detection technique reelle sous Windows
+  (voir plus bas). La consigne de ne pas utiliser l'ecran d'un portable reste
+  rappelee dans la section Consignes du formulaire.
+- Reglages de session memorises dans un fichier JSON, par utilisateur. Au
+  lancement suivant, un court ecran recapitule (texte non modifiable) les
+  reglages memorises avec une case a cocher "Modifier ces reglages avant de
+  commencer" (decochee par defaut) : si elle reste decochee, la seance demarre
+  directement avec ces reglages (apres revalidation materielle silencieuse),
+  sans repasser par la fenetre complete. Si les reglages valides different de la
+  derniere seance de cet utilisateur, une popup recapitule les ecarts et demande
+  confirmation avant de lancer la seance (`_confirm_settings_change`).
+- La table de correspondance direction/touche N'EST PAS recopiee litteralement du
+  MATLAB : elle reste deduite geometriquement du vecteur de deplacement reellement
+  affiche (comme dans la version precedente), ce qui la rend automatiquement
+  autocoherente (ce que montre l'affichage EST ce qui est note correct) quel que
+  soit le sens d'axe Y du moteur graphique. Un auto-test verifie cette propriete au
+  demarrage (voir `run_self_consistency_check`).
+- Timing aligne sur HuxlinLabFBAtraining.m : aucune pause artificielle ; le calcul
+  des positions initiales des points est absorbe dans l'ISI post-cue compensee,
+  exactement comme `WaitSecs(.5-(GetSecs-bb))` en MATLAB.
+  DEVIATION ASSUMEE (demandee explicitement le 27/08) : contrairement a MATLAB (qui
+  n'exclut le temps de pause d'aucun chronometre), le temps passe en pause -- Echap
+  pendant l'attente de reponse, ou pause programmee entre deux essais -- est retranche
+  a la fois du temps de reaction par essai et de la duree totale de seance (voir
+  total_paused_s dans run_session).
+- La toute premiere image du stimulus montre les points a leur position initiale
+  non deplacee (comme MATLAB), le mouvement commence a la 2e image.
+- Precue = deux segments divergents (chevron), reproduisant la version
+  actuellement active de HuxlinLabFBAtraining.m (mise a jour du 10/05/21), et non
+  plus le triangle plein de l'ancienne version. Activable/desactivable au setup.
+  Les segments sont reconstruits a chaque essai (jamais reassignes via .start/.end
+  sur un objet reutilise) pour rester fiables quelle que soit la version de PsychoPy.
+  DEVIATION ASSUMEE : l'ouverture visuelle du chevron est plafonnee a
+  PRECUE_MIN_OPENING_DEG (le MATLAB source, lui, l'ouvre exactement a l'angle du
+  staircase courant, sans plancher reel -- voir compute_precue_geometry) pour
+  rester lisible aux essais difficiles ; la direction du mouvement reellement
+  affiche, elle, n'est jamais plafonnee. La longueur des bras est egalement
+  multipliee par PRECUE_LENGTH_MULTIPLIER (1.5x, demande le 27/08) par rapport
+  a la formule MATLAB fidele (resolution(1)/cue_scale).
+- Anti-triche ecran (3e garde-fou, Windows uniquement) : detection technique
+  reelle d'un ecran interne via l'API CCD (`detect_windows_internal_display`,
+  QueryDisplayConfig). Avertissement seulement, jamais de blocage dur -- ce code
+  n'a pas pu etre teste sur une machine Windows reelle pendant le developpement.
+- Verification physique de calibration (carre + trait a l'echelle reelle,
+  reproduisant test_rect2/test_size/test_size2 de HuxlinLabFBAtraining.m,
+  l.337-361) avant le premier essai. AJOUT PAR RAPPORT A MATLAB (demande le
+  27/08) : confirmation explicite (continuer / corriger / quitter), redirigeant
+  vers le MEME formulaire de calibration en cas de correction -- jamais un
+  second point de saisie. DEVIATION ASSUMEE supplementaire (demandee le meme
+  jour) : contrairement a MATLAB, qui la redemande a CHAQUE lancement sans
+  exception, elle n'est redemandee ici que la premiere fois, ou si le profil
+  ecran reellement resolu change depuis la derniere confirmation (voir
+  SessionSettings.calibration_verified et run_setup_wizard).
+- Pauses configurables (0, 1 ou 2), minuteur d'une minute, signal sonore distinct.
+- Aucun compteur d'essai affiche a l'ecran pendant la seance (retire sur demande) ;
+  le numero de chaque essai reste enregistre dans les logs et le CSV de sortie.
+- Journal de bord (logs) par seance pour faciliter le depannage a distance.
+- Elevation de priorite OS (`core.rush`) autour de [son de depart + mouvement],
+  reproduisant Priority(MaxPriority(w))/Priority(0) de MATLAB (l.555-556/582) --
+  AJOUT PAR RAPPORT AU PYTHON PRECEDENT (demande le 27/08 suite a un signal
+  utilisateur de variation de vitesse des points lors d'un changement de source
+  d'alimentation). Chaque essai mesure aussi la duree reelle de sa boucle de
+  mouvement et la compare a la duree nominale attendue (`check_movement_timing`,
+  TIMING_ANOMALY_THRESHOLD) : un ecart significatif est journalise et marque
+  dans le CSV de sortie (colonne anomalie_timing), sans interrompre la seance.
+- Verification initiale de performance (NOUVEAU, absent de MATLAB) : au debut de
+  chaque seance, PERF_CHECK_N_TRIALS essais visuellement identiques a de vrais
+  essais sont executes silencieusement (resultats non comptabilises) pour
+  mesurer le rythme d'affichage reellement obtenu sur cette machine. En cas
+  d'anomalie, la seance est BLOQUEE avec un message a l'ecran (code E10) --
+  design confirme explicitement par l'utilisateur le 27/08 (phase silencieuse
+  + blocage, plutot qu'une revalidation apres chaque pause, jugee trop lourde).
+- Detection non bloquante d'un changement de source d'alimentation secteur/
+  batterie en cours de seance sous Windows (`get_windows_power_status`,
+  `check_power_source_change`, code E11) : avertissement journalise + note sur
+  l'ecran de fin de seance, jamais de popup interrompant un essai en cours.
+  AJOUT PAR RAPPORT A MATLAB, demande le 27/08 suite au signal utilisateur
+  d'origine (laptop gaming bride en fonctionnement sur batterie).
+- Sauvegarde des resultats avec repli automatique (code E12) : en cas d'echec
+  d'ecriture a l'emplacement habituel (disque plein, droits refuses), une
+  sauvegarde de secours est tentee dans le repertoire temporaire du systeme ;
+  si meme ce repli echoue, le patient/l'aidant en est informe a l'ecran de fin
+  de seance. AJOUT PAR RAPPORT AU PYTHON PRECEDENT, qui n'avait aucune gestion
+  d'exception autour de cette ecriture (risque reel de perte de donnees apres
+  une seance complete).
+- Catalogue de codes d'erreur (E01-E13, E98-E99) reference dans le manuel
+  utilisateur, affiche entre crochets dans le titre de chaque popup
+  d'erreur/avertissement reel (les annulations volontaires -- Echap, bouton
+  Annuler -- n'en ont pas, ce sont des sorties normales). Comprend aussi deux
+  lacunes precedemment silencieuses desormais couvertes : echec d'ouverture de
+  la fenetre PsychoPy (E98, popup ajoute) et peripherique audio indisponible
+  (E13, log ajoute, toujours sans popup -- juge non essentiel a la validite de
+  l'exercice).
+- Gestion d'exception ajoutee autour de la sauvegarde des preferences/reglages
+  (`_save_json`, CORRECTIF, round du 27/08) : un echec d'ecriture (disque
+  plein, droits refuses, chemin invalide) est desormais journalise (WARNING,
+  si un logger est disponible a cet instant) et n'interrompt jamais
+  l'appelant, au lieu de faire planter l'application. Les resultats de seance
+  (CSV/JSON, code E12) etaient deja proteges depuis le round precedent ; ceci
+  couvre le reste (langue, reglages patient, compteur de seances, dernier
+  sujet) -- risque juge faible car aucune donnee de seance n'est concernee.
+- Statistiques agregees de temps de reponse dans le JSON de resume
+  (`compute_rt_statistics`, AJOUT, round du 27/08) : moyenne/mediane
+  globales, plus moyenne/mediane/ecart-type par staircase. Recommande par
+  l'audit V4 (sections 7.3 et 13.3), purement descriptif -- n'influence ni le
+  staircase ni le deroulement de la seance.
+- Commentaire perime corrige pres de l'ouverture de fenetre (main()), qui
+  affirmait a tort que la verification physique de calibration s'affiche a
+  CHAQUE seance comme en MATLAB. Le comportement reel (une seule fois par
+  profil ecran exact) est inchange depuis la consolidation initiale ; seul le
+  commentaire etait faux -- incoherence documentaire relevee lors de la
+  redaction du rapport d'evolution.
+
+- Tous les champs du formulaire de configuration sont desormais marques
+  obligatoires (astérisque + legende, round 4, 27/08, demande explicitement) :
+  identifiant patient vide refuse (auparavant repli silencieux sur un
+  identifiant par defaut), largeur physique <=0 refusee (auparavant seule une
+  valeur laissee vide levait une erreur, une valeur explicitement a 0 ou
+  negative passait). La diagonale et la largeur physique de l'ecran ne sont
+  plus jamais pre-remplies avec une valeur non mesuree pour un patient sans
+  historique reel (ni le placeholder "recommande", ni l'ancienne estimation
+  automatique a partir de la seule diagonale, desormais un simple filet de
+  securite pour d'anciens reglages sauvegardes -- voir
+  estimate_width_cm_from_diagonal) : le champ est vide, une mesure reelle est
+  requise. Un patient avec un historique reel continue de voir sa derniere
+  mesure, comme avant.
+
+This is a HOME TRAINING script. It is not an eye-tracked laboratory verification
+tool (no gaze-contingent fixation control), consistently with HuxlinLabFBAtraining.m
+which likewise has no Eyelink dependency.
+"""
+
+from __future__ import annotations
+
+import csv
+import datetime as _dt
+import json
+import logging
+import math
+import os
+import platform
+import statistics
+import sys
+import tempfile
+import traceback
+from dataclasses import dataclass, asdict, field, fields
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+from psychopy import core, event, gui, monitors, sound, visual
+
+# -----------------------------------------------------------------------------
+# Identite du logiciel / chemins
+# -----------------------------------------------------------------------------
+
+SOFTWARE_VERSION = "2.10.0"
+SOFTWARE_NAME = "FBA_TiltGlobal_HomeTraining"
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_DIRNAME = "config"                 # calibration ecran + reglages memorises
+DATA_DIRNAME = "session_data"             # anciennement "data" -- renomme pour plus de clarte
+LOGS_DIRNAME = "logs"                     # sous-dossier de session_data
+
+MONITOR_CACHE_FILE = os.path.join(BASE_DIR, CONFIG_DIRNAME, "monitor_profiles.json")
+SETTINGS_FILE = os.path.join(BASE_DIR, CONFIG_DIRNAME, "session_settings.json")
+COUNTERS_FILE = os.path.join(BASE_DIR, CONFIG_DIRNAME, "session_counters.json")
+APP_PREFS_FILE = os.path.join(BASE_DIR, CONFIG_DIRNAME, "app_preferences.json")
+
+DEFAULT_SUBJECT_ID = "0000"
+
+# -----------------------------------------------------------------------------
+# Constantes de protocole (fidelite HuxlinLabFBASetup.m / HuxlinLabFBAtraining.m)
+# -----------------------------------------------------------------------------
+# Ces valeurs sont volontairement regroupees et commentees individuellement avec
+# leur source, pour qu'une revue future puisse verifier chaque nombre en un coup
+# d'oeil plutot que de devoir relire tout le fichier.
+
+# Echelle de difficulte a 12 niveaux, quasi-logarithmique (HuxlinLabFBASetup.m l.56)
+ANGLE_RANGE_DEG: List[float] = [85.0, 53.1, 33.2, 20.75, 12.97, 8.1, 5.1, 3.2, 2.0, 1.2, 0.8, 0.5]
+
+# 3 staircases entrelaces, index de depart 1/4/8 en MATLAB (1-based) = 0/3/7 ici (0-based)
+N_STAIRCASES = 3
+INITIAL_STAIR_IDXS = [0, 3, 7]
+STAIRCASE_UP_STREAK = 3            # 3 succes consecutifs -> niveau plus difficile
+TOTAL_TRIALS_DEFAULT = 300         # 100 par staircase x 3, comme n_trials*n_staircases en MATLAB
+
+# Geometrie / timing du stimulus (HuxlinLabFBASetup.m)
+VIEWING_DISTANCE_CM_DEFAULT = 42.0
+SCREEN_WIDTH_CM_DEFAULT = 61.0
+CUE_DURATION_S = 0.2                       # cue_duration (l.53)
+POST_CUE_ISI_S = 0.5                       # delai fixe post-cue, compense comme MATLAB (l.554)
+STIMULUS_DURATION_MS = 500.0               # stimulus_duration (l.43)
+DOT_LIFETIME_MS = 200.0                    # dot_lifetime -- CORRIGE (etait 250 par erreur, l.49 de HuxlinLabFBASetup.m = 200)
+APERTURE_RADIUS_DEG = 2.5                  # aperture_radius (l.44)
+DOT_DENSITY_PER_DEG2 = 3.5                 # dot_density (l.45)
+DOT_SPEED_DEG_PER_S = 10.0                 # dot_speed (l.48)
+DOT_SIZE_ARCMIN = 14.0                     # initial_dot_size (l.46)
+BACKGROUND_RGB = 0.0                       # CORRIGE : rgb 0.0 = 128/255 (gris moyen), pas 0.5 (etait trop clair)
+DOT_COLOR_RGB = -1.0                       # noir, fidele (dot_color=0/255)
+FIX_OUTER_RADIUS_DEG = 0.10
+FIX_INNER_RADIUS_DEG = 0.05
+FIX_OUTER_COLOR_RGB = -1.0                 # noir  (Screen('FillOval',w,0,...))
+FIX_INNER_COLOR_RGB = 1.0                  # blanc (Screen('FillOval',w,255,...))
+CUE_SCALE = 110.0                          # cue_scale (l.54) -- longueur des bras du chevron = res_x/CUE_SCALE
+CUE_COLOR_RGB = 1.0                        # blanc, fidele (cue_color = [255 255 255])
+# DEVIATION ASSUMEE (demandee explicitement apres test reel, voir compute_precue_geometry) :
+# le MATLAB source ouvre le chevron exactement a angle_deviationP, SANS plancher reel (le
+# seul code de "plancher" du fichier, la variable `yy`, est calcule mais jamais utilise
+# pour le rendu -- voir le commentaire dans compute_precue_geometry). Aux essais difficiles
+# (angle_deviationP jusqu'a 0.5 deg), les deux segments du chevron se confondent quasiment
+# en un seul trait, rendant la precue peu lisible. PRECUE_MIN_OPENING_DEG plafonne
+# l'OUVERTURE VISUELLE du chevron uniquement -- jamais angle_deg, qui determine la vraie
+# direction du mouvement affiche et reste exactement fidele au niveau de difficulte reel.
+# DEVIATION ASSUMEE (demandee explicitement le 27/08, apres test reel) : la
+# longueur des deux bras du chevron est multipliee par ce facteur pour rester
+# lisible. Applique a r_px (voir compute_precue_geometry) APRES la formule
+# MATLAB fidele (resolution(1)/cue_scale) plutot que de modifier CUE_SCALE
+# lui-meme, pour garder CUE_SCALE = 110.0 comme constante MATLAB pure et
+# clairement identifiable. N'affecte QUE la longueur visuelle des traits :
+# l'ouverture angulaire (PRECUE_MIN_OPENING_DEG ci-dessus) et la direction
+# reelle du mouvement affiche (angle_deg, jamais plafonnee) restent inchangees.
+PRECUE_LENGTH_MULTIPLIER = 1.5
+PRECUE_MIN_OPENING_DEG = 20.0
+POST_RESPONSE_GAP_S = 0.0                  # AUCUNE pause artificielle apres reponse (fidele a MATLAB)
+POST_START_SOUND_GAP_S = 0.05              # WaitSecs(0.05) apres le son de depart (l.562) -- reel, pas invente
+ESCAPE_DEBOUNCE_S = 0.2                    # pause(.2) avant l'affichage du texte de pause Echap (l.640)
+
+# Sons -- tonalites generees (pas de fichiers .wav embarques), frequences fideles
+# aux valeurs Beeper() de la branche macOS de HuxlinLabFBAtraining.m (l.557-561,
+# l.590-593, l.621-624). Le son de pause programmee est une fonctionnalite
+# nouvelle (absente de MATLAB), volontairement tres distincte des 3 autres.
+START_TONE_HZ = 1000.0
+CORRECT_TONE_HZ = 1200.0
+INCORRECT_TONE_HZ = 800.0
+PAUSE_TONE_HZ = 400.0
+PAUSE_TONE_DURATION_S = 0.4
+
+# Pause programmee (nouvelle fonctionnalite, 0/1/2 pauses par seance)
+SCHEDULED_PAUSE_DURATION_S = 60.0
+TEXT_COLOR_RGB = -1.0                      # noir, comme le texte MATLAB (DrawText ... 0)
+DISCLAIMER_COLOR_RGB = (0.65, -0.75, -0.75)  # rouge assombri (rgb ; ~RGB255 210,32,32) -- demande
+                                              # le 27/08, puis assombri le meme jour (le rouge pur
+                                              # (1,-1,-1) etait juge "fluo", peu lisible). Pour le
+                                              # paragraphe de warning sante de l'ecran pre-lancement
+                                              # uniquement (readme_disclaimer).
+README_BLOCK_GAP_PX = 30                   # espace vertical entre les 3 blocs empiles de
+                                            # l'ecran pre-lancement (voir main()), mesure en
+                                            # pixels via TextStim.boundingBox plutot que suppose
+
+# -----------------------------------------------------------------------------
+# Garde-fous materiels (nouveaux -- decides avec l'utilisateur)
+# -----------------------------------------------------------------------------
+# Le calcul degre->pixel de MATLAB comme de ce script est une approximation
+# "ecran plat" a facteur d'echelle moyen (voir le rapport d'audit, section 5.1) :
+# valide pres du centre, mais un ecran trop petit ou trop bas-de-gamme peut a la
+# fois (a) ne pas couvrir l'excentricite cliniquement requise et (b) rendre les
+# points/le cue avec trop peu de pixels pour rester nets. On bloque les deux cas.
+MIN_RESOLUTION_PX = (1920, 1080)           # Full HD minimum, obligatoire
+MIN_DIAGONAL_IN = 22.0                     # seuil bloquant
+RECOMMENDED_DIAGONAL_IN = 24.0             # seuil recommande (avertissement en dessous)
+MIN_DOT_SIZE_PX = 5                        # jamais de stimulus a 3-4px de large
+DEFAULT_ASPECT_W, DEFAULT_ASPECT_H = 16, 9  # hypothese si la largeur cm n'est pas mesuree
+
+# Aucune API multiplateforme fiable ne permet, depuis PsychoPy, de verifier qu'un
+# ecran est physiquement externe (vs. dalle integree d'un ordinateur portable) :
+# la diagonale saisie reste une declaration de l'utilisateur. On ajoute donc cette
+# heuristique souple de plausibilite : la densite de pixels impliquee par la
+# resolution detectee et la diagonale declaree doit rester dans une fourchette
+# usuelle d'ecran externe. En dehors de cette fourchette (typiquement une dalle
+# d'ordinateur portable haute densite declaree avec une grande diagonale), on
+# avertit sans bloquer -- car des configurations externes atypiques existent
+# reellement. Voir aussi detect_windows_internal_display pour une detection
+# technique reelle (pas une heuristique) sous Windows.
+MIN_PLAUSIBLE_DPI = 60.0
+MAX_PLAUSIBLE_DPI = 220.0
+
+SELF_TEST_TOLERANCE = 1e-9
+
+# -----------------------------------------------------------------------------
+# Garde-fous de performance/robustesse (nouveaux, absents de MATLAB) -- AJOUTS
+# demandes le 27/08 suite a un signal utilisateur reel et concret : variation
+# de la vitesse des points constatee en (de)branchant le secteur d'un laptop
+# gaming en cours de seance (throttling CPU/GPU), et "trainee" visuelle
+# (ghosting) constatee sur un ecran externe bas de gamme. Etude du MATLAB :
+# HuxlinLabFBASetup.m code frame_rate=60 EN DUR (jamais mesure), et
+# HuxlinLabFBAtraining.m l.227 desactive explicitement les tests de
+# synchronisation de Psychtoolbox (Screen('Preference','SkipSyncTests',1)) --
+# MATLAB n'offre donc AUCUNE protection contre ce type de variation, ce risque
+# est herite, pas introduit par le portage. En revanche MATLAB eleve la
+# priorite du processus OS pendant la boucle d'affichage du mouvement
+# uniquement (Priority()/MaxPriority(), l.555-556, reinitialisee l.582) --
+# equivalent absent du script Python depuis le tout premier brouillon (verifie
+# le 27/08). Voir check_movement_timing, run_performance_check,
+# get_windows_power_status, et le core.rush() dans run_session.
+TIMING_ANOMALY_THRESHOLD = 0.15            # ecart relatif audela duquel un essai est flague
+PERF_CHECK_N_TRIALS = 3                    # essais d'echauffement silencieux avant la vraie sequence
+PERF_CHECK_ANGLE_DEV_DEG = ANGLE_RANGE_DEG[0]  # niveau le plus facile (85 deg) -- ne teste pas le patient
+
+# -----------------------------------------------------------------------------
+# Codes d'erreur -- reference pour le manuel utilisateur (demande explicitement
+# le 27/08 : "referencer tous les popup d'erreur et les repertorier"). Couvrent
+# uniquement les erreurs et avertissements reels ; les annulations volontaires
+# de l'utilisateur (Echap, bouton Annuler) n'en ont pas -- ce sont des sorties
+# normales, deja tracees en logger.info.
+# -----------------------------------------------------------------------------
+ERR_CODE_RESOLUTION = "E01"          # resolution sous le minimum Full HD
+ERR_CODE_DIAGONAL_MIN = "E02"        # diagonale sous le minimum absolu
+ERR_CODE_STIM_FIT = "E03"            # stimulus ne rentre pas a l'ecran
+ERR_CODE_DOT_SIZE = "E04"            # rendu des points trop grossier
+ERR_CODE_INVALID_INPUT = "E05"       # saisie de formulaire invalide
+ERR_CODE_DIAGONAL_WARN = "E06"       # diagonale sous la recommandation
+ERR_CODE_DPI = "E07"                 # densite de pixels inhabituelle
+ERR_CODE_INTERNAL_DISPLAY = "E08"    # ecran interne detecte (Windows)
+ERR_CODE_PERF_CHECK = "E10"          # anomalie de performance a la verification initiale
+ERR_CODE_POWER_SOURCE = "E11"        # changement secteur/batterie en cours de seance
+ERR_CODE_SAVE_FAILURE = "E12"        # echec de sauvegarde des resultats
+ERR_CODE_AUDIO = "E13"               # peripherique audio indisponible (log seul)
+ERR_CODE_WINDOW_OPEN = "E98"         # echec d'ouverture de la fenetre PsychoPy
+ERR_CODE_STARTUP_SELFTEST = "E99"    # echec des auto-tests de demarrage
+
+# -----------------------------------------------------------------------------
+# Internationalisation (FR par defaut, EN disponible)
+# -----------------------------------------------------------------------------
+# Toutes les chaines visibles par l'utilisateur passent par ce dictionnaire pour
+# garantir qu'aucun texte n'est oublie lors d'un changement de langue. La fonction
+# `t()` plus bas leve une erreur explicite si une cle manque dans une langue,
+# plutot que d'afficher silencieusement du texte dans la mauvaise langue.
+
+TR: Dict[str, Dict[str, str]] = {
+    "fr": {
+        "app_title": "Entrainement Huxlin - Discrimination fine de direction (FBA)",
+        "lang_dlg_title": "Langue / Language",
+        "lang_field": "Langue de l'application",
+        "identity_dlg_title": "1/5 - Identite",
+        "field_subject_id": "Identifiant (en 4 chiffres)",
+        "field_language": "Langue",
+        "recall_dlg_title": "Reglages memorises",
+        "recall_intro": (
+            "Voici les reglages de la derniere seance de cet utilisateur. Ils seront "
+            "reutilises tels quels. Cochez la case ci-dessous UNIQUEMENT si vous "
+            "voulez les modifier avant de commencer."
+        ),
+        "field_modify": "Modifier ces reglages avant de commencer",
+        "setup_dlg_title": "Configuration de la seance",
+        "section_consignes": "<b>Consignes</b>",
+        "consignes_text": (
+            "- Suivez les instructions d'installation de l'ecran et de la mentonniere "
+            "fournies dans le manuel d'utilisation. Respectez une distance oeil-ecran "
+            "de 42 cm.\n"
+            "- Votre position doit etre precisement la meme a chaque seance. Dans la "
+            "mesure du possible, gardez le dos droit, les deux pieds au sol et une "
+            "assise au fond du siege.\n"
+            "- N'utilisez pas l'ecran d'un ordinateur portable, un ecran de diagonale "
+            "inferieure a 22 pouces, ou de resolution inferieure au Full HD."
+        ),
+        # AJOUT PAR RAPPORT AU PYTHON PRECEDENT (round 4, demande le 27/08) : legende
+        # expliquant l'asterisque desormais accole a chaque champ du formulaire (voir
+        # _ask_full_settings) -- tous les champs sont obligatoires, aucun ne peut plus
+        # etre laisse vide ou a une valeur non mesuree pour etre soumis.
+        "field_required_note": "* Tous les champs sont obligatoires.",
+        "section_user": "<b>Utilisateur</b>",
+        "section_screen": "<b>Parametres de l'ecran</b>",
+        "section_exercise": "<b>Parametre de l'exercice</b>",
+        "section_stimulus": "<b>Parametres du stimulus</b>",
+        "warn_dpi_title": "Combinaison ecran inhabituelle",
+        "warn_dpi_msg": (
+            "La diagonale saisie ({diag:.1f} po) et la resolution detectee ({res}) "
+            "donnent une densite d'environ {dpi:.0f} points/pouce, ce qui est inhabituel "
+            "pour un ecran externe standard (cette densite est plus typique d'un ecran "
+            "d'ordinateur portable). Verifiez votre saisie.\n\nContinuer quand meme ?"
+        ),
+        "warn_internal_display_title": "Ecran interne detecte",
+        "warn_internal_display_msg": (
+            "Windows signale qu'au moins un ecran actuellement actif est une dalle "
+            "interne (integree a l'ordinateur), pas un moniteur externe. Cela peut "
+            "en theorie se declencher a tort dans de rares configurations (plusieurs "
+            "ecrans actifs, pilote graphique atypique). Verifiez votre installation "
+            "ou consultez la documentation technique pour plus d'information."
+            "\n\nContinuer quand meme ?"
+        ),
+        "screen_dlg_title": "2/5 - Calibration de l'ecran",
+        "screen_intro": (
+            "N'utilisez pas l'ecran integre d'un ordinateur portable : branchez et "
+            "selectionnez un ecran externe."
+        ),
+        "field_diagonal_in": "Diagonale de l'ecran (pouces)",
+        # CORRECTIF (round 4, 27/08) : l'ancien libelle "laisser 0 pour estimer" invitait
+        # a soumettre une largeur non mesuree (estimee depuis la seule diagonale) --
+        # retire a la demande de l'utilisateur, une mesure physique reelle est desormais
+        # obligatoire (voir estimate_width_cm_from_diagonal, conservee uniquement comme
+        # filet de securite pour d'anciens reglages sauvegardes avant ce correctif).
+        "field_width_cm": "Largeur physique mesuree (cm)",
+        "field_distance_cm": "Distance oeil-ecran (cm)",
+        "field_screen_choice": "Ecran a utiliser (0=principal)",
+        "screen_detected": "Ecrans detectes",
+        "err_resolution_title": "Resolution insuffisante",
+        "err_resolution_msg": (
+            "Resolution detectee : {res}. Le minimum requis est {minres} (Full HD).\n"
+            "Branchez un ecran conforme et relancez le programme."
+        ),
+        "err_diagonal_title": "Ecran trop petit",
+        "err_diagonal_msg": (
+            "Diagonale saisie : {diag:.1f} po. Le minimum requis est {mindiag:.0f} po.\n"
+            "Les ecrans d'ordinateur portable ne sont pas autorises : utilisez un ecran "
+            "externe d'au moins {mindiag:.0f} pouces (ideal : {recdiag:.0f} po ou plus)."
+        ),
+        "warn_diagonal_title": "Taille d'ecran en dessous de la recommandation",
+        "warn_diagonal_msg": (
+            "Diagonale saisie : {diag:.1f} po. Le seuil minimal ({mindiag:.0f} po) est respecte, "
+            "mais {recdiag:.0f} pouces ou plus est recommande pour un confort optimal.\n"
+            "Continuer quand meme ?"
+        ),
+        "err_dotsize_title": "Rendu du stimulus trop grossier",
+        "err_dotsize_msg": (
+            "Avec cette configuration, chaque point ne mesurerait que {px} pixel(s) de large "
+            "(minimum requis : {minpx} px). Rapprochez-vous, utilisez un ecran de resolution "
+            "superieure, ou verifiez la distance/diagonale saisies."
+        ),
+        "position_dlg_title": "3/5 - Position et orientation",
+        "field_axis": "Axe de reponse",
+        "axis_vertical": "Vertical - reponse Haut/Bas",
+        "axis_horizontal": "Horizontal - reponse Gauche/Droite",
+        "field_fix_h": "Fixation - decalage horizontal (deg, gauche(-)/droite(+))",
+        "field_fix_v": "Fixation - decalage vertical (deg, bas(-)/haut(+))",
+        "field_stim_h": "Stimulus - excentricite horizontale (deg, gauche(-)/droite(+))",
+        "field_stim_v": "Stimulus - excentricite verticale (deg, bas(-)/haut(+))",
+        "session_dlg_title": "4/5 - Parametres de la seance",
+        "field_n_trials": "Nombre de taches (ajuste automatiquement a un multiple de 3)",
+        "field_precue": "Afficher la precue",
+        "field_pause_mode": "Pauses pendant la seance",
+        "pause_0": "Aucune pause",
+        "pause_1": "1 pause (a la moitie)",
+        "pause_2": "2 pauses (au tiers et aux deux tiers)",
+        "err_fit_title": "Le stimulus ne rentre pas a l'ecran",
+        "err_fit_msg": (
+            "Avec la calibration actuelle, un stimulus a {ecc:.1f} deg d'excentricite "
+            "(+ {ap:.1f} deg de rayon) depasserait le bord de l'ecran (champ disponible : "
+            "{fov:.1f} deg). Reduisez l'excentricite ou rapprochez-vous."
+        ),
+        "confirm_changed_title": "Confirmer les modifications",
+        "confirm_changed_intro": "Recapitulatif avant de lancer la seance :",
+        "confirm_changed_diff": (
+            "Vous avez modifie les reglages suivants par rapport a la derniere seance de "
+            "cet utilisateur :"
+        ),
+        "confirm_position_line": (
+            "Position du stimulus : H = {h:.2f} deg ({h_side}), V = {v:.2f} deg ({v_side})"
+        ),
+        "side_left": "gauche", "side_right": "droite", "side_up": "haut", "side_down": "bas",
+        "confirm_proceed": "Lancer la seance avec ces reglages ?",
+        "btn_yes": "Oui", "btn_no": "Non, corriger",
+        "calib_check_body": (
+            "VERIFICATION PHYSIQUE DE LA CALIBRATION\n\n"
+            "A l'aide d'une regle, mesurez sur l'ecran :\n"
+            "- la largeur du carre blanc : elle doit mesurer {box_cm:.1f} cm ({box_in:.2f} po)\n"
+            "- la longueur du trait reliant la croix de fixation au carre : elle doit mesurer "
+            "{line_cm:.1f} cm ({line_in:.2f} po)\n\n"
+            "Ces mesures correspondent-elles ?\n"
+            "ESPACE = Oui, continuer   -   RETOUR ARRIERE = Non, corriger la calibration   -   ECHAP = Quitter"
+        ),
+        "readme_title": "LISEZ-MOI / MISE EN PLACE",
+        "readme_body_intro": (
+            "Ce programme reproduit une tache d'entrainement Huxlin de discrimination fine "
+            "de direction (points en mouvement coherent) avec une precue centrale "
+            "informative.\n\n"
+            "Important : cet outil est concu pour un usage a domicile, sans suivi oculaire. "
+            "Il ne remplace pas une verification en laboratoire avec suivi du regard. "
+            "Gardez les yeux fixes sur le point central pendant toute la seance."
+        ),
+        "readme_disclaimer": (
+            "Attention : cet exercice doit etre realise avec l'accord prealable d'un "
+            "professionnel de sante qualifie (neurologue, ophtalmologiste, orthoptiste, "
+            "neuropsychologue, etc.). Arretez immediatement l'exercice en cas de fatigue "
+            "importante, photosensibilite, gene visuelle, douleur, vertige, malaise, "
+            "migraine ou aggravation de vos symptomes. L'association decline toute "
+            "responsabilite dans l'usage de cette application. Pour plus d'information, "
+            "rendez-vous sur www.NeuroVisionSolidaire.org"
+        ),
+        "readme_body_details": (
+            "Position de la croix de fixation : H = {fix_h:.2f} deg, V = {fix_v:.2f} deg\n"
+            "Position du stimulus : H = {h:.2f} deg, V = {v:.2f} deg\n"
+            "Distance de visionnage : {dist:.1f} cm - Diagonale ecran : {diag:.1f} po\n"
+            "Nombre de taches : {ntrials} - Precue activee : {precue}\n\n"
+            "{axis_instruction}\n\n"
+            "Appuyez sur ESPACE pour commencer, ou ECHAP pour quitter."
+        ),
+        "instr_vertical": "Utilisez les fleches HAUT et BAS.\n\nHAUT = mouvement incline vers le haut\nBAS = mouvement incline vers le bas",
+        "instr_horizontal": "Utilisez les fleches GAUCHE et DROITE.\n\nGAUCHE = mouvement incline vers la gauche\nDROITE = mouvement incline vers la droite",
+        "yes": "Oui", "no": "Non",
+        "pause_title": "PAUSE",
+        "pause_text": "Pause en cours - reprise automatique dans {secs} s\n\nAppuyez sur ESPACE pour reprendre immediatement.",
+        "escape_paused_title": "Programme en pause",
+        "escape_paused_text": (
+            "Tache en cours : {trial}/{total}\n\n"
+            "Appuyez sur une touche pour continuer,\nou de nouveau sur ECHAP pour quitter definitivement."
+        ),
+        "escape_quit_saved": "Seance interrompue par l'utilisateur. Les donnees ont ete enregistrees.",
+        "end_complete_title": "Entrainement termine !",
+        "end_aborted_title": "Seance interrompue",
+        "end_error_title": "Erreur inattendue",
+        "end_accuracy": "Precision : {acc:.1f} %",
+        "end_final_level": "Niveau moyen final des staircases : {lvl:.2f} deg",
+        "end_trials": "Taches completees : {done}/{total}",
+        "end_note_fit": "Pour un ajustement psychometrique complet (Weibull), utilisez le script d'analyse dedie (DataFitting).",
+        "end_press_key": "Appuyez sur une touche pour fermer.",
+        "err_generic_title": "Erreur",
+        "err_invalid_inputs": "Une ou plusieurs valeurs saisies sont invalides. Veuillez recommencer.",
+        "err_perf_check_title": "Anomalie de performance detectee",
+        "err_perf_check_msg": (
+            "La verification initiale de performance a detecte un ecart significatif entre le "
+            "rythme d'affichage attendu et le rythme reellement obtenu sur cet ordinateur (par "
+            "exemple : changement recent de source d'alimentation, ou charge processeur/graphique "
+            "inhabituelle).\n\n"
+            "Pour la fiabilite de l'exercice, la seance ne peut pas demarrer dans ces conditions.\n\n"
+            "Fermez les autres programmes en cours d'execution, branchez l'ordinateur sur secteur, "
+            "puis relancez le logiciel. Si le probleme persiste, referez-vous au manuel d'utilisation."
+        ),
+        "err_window_title": "Impossible d'ouvrir la fenetre d'affichage",
+        "err_window_msg": (
+            "Le logiciel n'a pas reussi a ouvrir la fenetre d'affichage sur l'ecran selectionne.\n\n"
+            "Verifiez que l'ecran est bien branche et allume, puis relancez le logiciel. Si le "
+            "probleme persiste, referez-vous au manuel d'utilisation ou contactez votre reference "
+            "technique."
+        ),
+        "warn_power_change_note": (
+            "Note : un changement de source d'alimentation (secteur/batterie) a ete detecte "
+            "pendant cette seance. Cela peut avoir temporairement affecte la fluidite de "
+            "l'affichage."
+        ),
+        "err_save_failed_note": (
+            "Attention : les resultats de cette seance n'ont pas pu etre enregistres a "
+            "l'emplacement habituel. Une copie de secours a ete tentee. Contactez votre reference "
+            "technique et signalez cet incident."
+        ),
+        "err_save_failed_total_note": (
+            "Attention : les resultats de cette seance n'ont pas pu etre enregistres, y compris "
+            "en secours (espace disque insuffisant ou droits d'acces refuses). Signalez cet "
+            "incident a votre reference technique avant de fermer cette fenetre si possible."
+        ),
+        "err_startup_selftest_title": "Echec des auto-tests de demarrage",
+        "err_startup_selftest_msg": (
+            "Le logiciel ne peut pas demarrer car une verification interne a echoue.\n\n"
+            "Detail technique : {detail}\n\n"
+            "Contactez votre reference technique en indiquant ce message."
+        ),
+    },
+    "en": {
+        "app_title": "Huxlin Home Training - Fine Direction Discrimination (FBA)",
+        "lang_dlg_title": "Language / Langue",
+        "lang_field": "Application language",
+        "identity_dlg_title": "1/5 - Identity",
+        "field_subject_id": "Subject ID",
+        "field_language": "Language",
+        "recall_dlg_title": "Remembered settings",
+        "recall_intro": (
+            "Here are this user's settings from the last session. They will be "
+            "reused as-is. Only tick the box below if you want to change something "
+            "before starting."
+        ),
+        "field_modify": "Modify these settings before starting",
+        "setup_dlg_title": "Session setup",
+        "section_consignes": "<b>Instructions</b>",
+        "consignes_text": (
+            "- Follow the screen and chin-rest setup instructions provided in the "
+            "user manual. Keep an eye-to-screen distance of 42 cm.\n"
+            "- Your position must be precisely the same at every session. As much as "
+            "possible, keep your back straight, both feet on the floor, and sit fully "
+            "back in the seat.\n"
+            "- Do not use a laptop's built-in screen, a screen with a diagonal below "
+            "22 inches, or a resolution below Full HD."
+        ),
+        "field_required_note": "* All fields are required.",
+        "section_user": "<b>User</b>",
+        "section_screen": "<b>Screen settings</b>",
+        "section_exercise": "<b>Exercise settings</b>",
+        "section_stimulus": "<b>Stimulus settings</b>",
+        "warn_dpi_title": "Unusual screen combination",
+        "warn_dpi_msg": (
+            "The entered diagonal ({diag:.1f} in) and detected resolution ({res}) "
+            "imply a pixel density of about {dpi:.0f} dpi, which is unusual for a "
+            "standard external screen (this density is more typical of a laptop "
+            "panel). Please double-check your entry.\n\nContinue anyway?"
+        ),
+        "warn_internal_display_title": "Internal display detected",
+        "warn_internal_display_msg": (
+            "Windows reports that at least one currently active display is a "
+            "built-in panel (integrated into the computer), not an external "
+            "monitor. This could in theory trigger incorrectly in rare "
+            "configurations (multiple active displays, an unusual graphics "
+            "driver). Please check your setup or refer to the technical "
+            "documentation for more information."
+            "\n\nContinue anyway?"
+        ),
+        "screen_dlg_title": "2/5 - Screen calibration",
+        "screen_intro": (
+            "Do not use a laptop's built-in screen: connect and select an external monitor."
+        ),
+        "field_diagonal_in": "Screen diagonal (inches)",
+        "field_width_cm": "Measured physical width (cm)",
+        "field_distance_cm": "Eye-to-screen distance (cm)",
+        "field_screen_choice": "Screen to use (0=primary)",
+        "screen_detected": "Detected screens",
+        "err_resolution_title": "Insufficient resolution",
+        "err_resolution_msg": (
+            "Detected resolution: {res}. The minimum required is {minres} (Full HD).\n"
+            "Please connect a compliant screen and restart the program."
+        ),
+        "err_diagonal_title": "Screen too small",
+        "err_diagonal_msg": (
+            "Entered diagonal: {diag:.1f} in. Minimum required: {mindiag:.0f} in.\n"
+            "Laptop screens are not allowed: use an external screen of at least "
+            "{mindiag:.0f} inches (ideally {recdiag:.0f}+ in)."
+        ),
+        "warn_diagonal_title": "Screen size below recommendation",
+        "warn_diagonal_msg": (
+            "Entered diagonal: {diag:.1f} in. The minimum threshold ({mindiag:.0f} in) is met, "
+            "but {recdiag:.0f}+ inches is recommended for optimal comfort.\n"
+            "Continue anyway?"
+        ),
+        "err_dotsize_title": "Stimulus rendering too coarse",
+        "err_dotsize_msg": (
+            "With this configuration, each dot would only be {px} pixel(s) wide "
+            "(minimum required: {minpx} px). Move closer, use a higher-resolution screen, "
+            "or double-check the entered distance/diagonal."
+        ),
+        "position_dlg_title": "3/5 - Position and orientation",
+        "field_axis": "Response axis",
+        "axis_vertical": "Vertical - Up/Down response",
+        "axis_horizontal": "Horizontal - Left/Right response",
+        "field_fix_h": "Fixation - horizontal offset (deg, left(-)/right(+))",
+        "field_fix_v": "Fixation - vertical offset (deg, down(-)/up(+))",
+        "field_stim_h": "Stimulus - horizontal eccentricity (deg, left(-)/right(+))",
+        "field_stim_v": "Stimulus - vertical eccentricity (deg, down(-)/up(+))",
+        "session_dlg_title": "4/5 - Session settings",
+        "field_n_trials": "Number of tasks (auto-rounded to a multiple of 3)",
+        "field_precue": "Show pre-cue",
+        "field_pause_mode": "Pauses during the session",
+        "pause_0": "No pause",
+        "pause_1": "1 pause (halfway)",
+        "pause_2": "2 pauses (at 1/3 and 2/3)",
+        "err_fit_title": "Stimulus does not fit on screen",
+        "err_fit_msg": (
+            "With the current calibration, a stimulus at {ecc:.1f} deg eccentricity "
+            "(+ {ap:.1f} deg radius) would extend past the screen edge (available field: "
+            "{fov:.1f} deg). Reduce the eccentricity or move closer."
+        ),
+        "confirm_changed_title": "Confirm changes",
+        "confirm_changed_intro": "Summary before starting the session:",
+        "confirm_changed_diff": (
+            "You have changed the following settings compared to this user's last session:"
+        ),
+        "confirm_position_line": (
+            "Stimulus position: H = {h:.2f} deg ({h_side}), V = {v:.2f} deg ({v_side})"
+        ),
+        "side_left": "left", "side_right": "right", "side_up": "up", "side_down": "down",
+        "confirm_proceed": "Start the session with these settings?",
+        "btn_yes": "Yes", "btn_no": "No, go back",
+        "calib_check_body": (
+            "PHYSICAL CALIBRATION CHECK\n\n"
+            "Using a ruler, measure on screen:\n"
+            "- the width of the white square: it should measure {box_cm:.1f} cm ({box_in:.2f} in)\n"
+            "- the length of the line connecting the fixation cross to the square: it should measure "
+            "{line_cm:.1f} cm ({line_in:.2f} in)\n\n"
+            "Do these measurements match?\n"
+            "SPACE = Yes, continue   -   BACKSPACE = No, correct the calibration   -   ESCAPE = Quit"
+        ),
+        "readme_title": "READ ME / SETUP",
+        "readme_body_intro": (
+            "This program implements a Huxlin-style fine direction discrimination training "
+            "task using a coherent-motion random-dot stimulus and a central informative "
+            "pre-cue.\n\n"
+            "Important: this tool is designed for home use, without eye tracking. "
+            "It does not replace a laboratory verification with gaze tracking. "
+            "Keep your eyes on the central fixation dot throughout the session."
+        ),
+        "readme_disclaimer": (
+            "Attention: this exercise must be carried out with the prior approval of a "
+            "qualified healthcare professional (neurologist, ophthalmologist, orthoptist, "
+            "neuropsychologist, etc.). Stop the exercise immediately in case of "
+            "significant fatigue, photosensitivity, visual discomfort, pain, dizziness, "
+            "faintness, migraine, or worsening of your symptoms. The association "
+            "declines all responsibility for the use of this application. For more "
+            "information, visit www.NeuroVisionSolidaire.org"
+        ),
+        "readme_body_details": (
+            "Fixation cross position: H = {fix_h:.2f} deg, V = {fix_v:.2f} deg\n"
+            "Stimulus location: H = {h:.2f} deg, V = {v:.2f} deg\n"
+            "Viewing distance: {dist:.1f} cm - Screen diagonal: {diag:.1f} in\n"
+            "Number of tasks: {ntrials} - Pre-cue enabled: {precue}\n\n"
+            "{axis_instruction}\n\n"
+            "Press SPACE to start, or ESC to quit."
+        ),
+        "instr_vertical": "Use the UP and DOWN arrow keys.\n\nUP = motion tilted upward\nDOWN = motion tilted downward",
+        "instr_horizontal": "Use the LEFT and RIGHT arrow keys.\n\nLEFT = motion tilted leftward\nRIGHT = motion tilted rightward",
+        "yes": "Yes", "no": "No",
+        "pause_title": "PAUSE",
+        "pause_text": "Pause in progress - auto-resume in {secs} s\n\nPress SPACE to resume immediately.",
+        "escape_paused_title": "Program paused",
+        "escape_paused_text": (
+            "Current task: {trial}/{total}\n\n"
+            "Press any key to continue,\nor press ESCAPE again to quit for good."
+        ),
+        "escape_quit_saved": "Session interrupted by the user. Data has been saved.",
+        "end_complete_title": "Training complete!",
+        "end_aborted_title": "Session interrupted",
+        "end_error_title": "Unexpected error",
+        "end_accuracy": "Accuracy: {acc:.1f} %",
+        "end_final_level": "Final mean staircase level: {lvl:.2f} deg",
+        "end_trials": "Tasks completed: {done}/{total}",
+        "end_note_fit": "For a full psychometric (Weibull) fit, use the dedicated analysis script (DataFitting).",
+        "end_press_key": "Press any key to close.",
+        "err_generic_title": "Error",
+        "err_invalid_inputs": "One or more entered values are invalid. Please try again.",
+        "err_perf_check_title": "Performance anomaly detected",
+        "err_perf_check_msg": (
+            "The initial performance check detected a significant gap between the expected "
+            "display rate and the rate actually achieved on this computer (for example: a recent "
+            "power source change, or unusual CPU/GPU load).\n\n"
+            "For the reliability of the exercise, the session cannot start under these "
+            "conditions.\n\n"
+            "Close other running programs, plug the computer into mains power, then restart the "
+            "software. If the problem persists, refer to the user manual."
+        ),
+        "err_window_title": "Could not open the display window",
+        "err_window_msg": (
+            "The software failed to open the display window on the selected screen.\n\n"
+            "Check that the screen is connected and powered on, then restart the software. If the "
+            "problem persists, refer to the user manual or contact your technical support contact."
+        ),
+        "warn_power_change_note": (
+            "Note: a power source change (mains/battery) was detected during this session. This "
+            "may have temporarily affected display smoothness."
+        ),
+        "err_save_failed_note": (
+            "Warning: this session's results could not be saved to the usual location. A backup "
+            "save was attempted. Contact your technical support contact and report this issue."
+        ),
+        "err_save_failed_total_note": (
+            "Warning: this session's results could not be saved at all, including the backup "
+            "attempt (insufficient disk space or access denied). Report this issue to your "
+            "technical support contact before closing this window if possible."
+        ),
+        "err_startup_selftest_title": "Startup self-test failure",
+        "err_startup_selftest_msg": (
+            "The software cannot start because an internal check failed.\n\n"
+            "Technical detail: {detail}\n\n"
+            "Contact your technical support contact and share this message."
+        ),
+    },
+}
+
+
+def t(key: str, lang: str, **kwargs) -> str:
+    """Translation helper. Raises loudly if a key is missing, rather than
+    silently falling back, so translation gaps are caught during testing
+    rather than discovered by a patient mid-session."""
+    try:
+        template = TR[lang][key]
+    except KeyError as exc:
+        raise KeyError(f"Missing translation for key={key!r} lang={lang!r}") from exc
+    return template.format(**kwargs) if kwargs else template
+
+
+def translations_are_complete() -> bool:
+    """Self-check: every key present in one language must be present in all others."""
+    all_keys = set()
+    for lang_dict in TR.values():
+        all_keys |= set(lang_dict.keys())
+    ok = True
+    for lang, lang_dict in TR.items():
+        missing = all_keys - set(lang_dict.keys())
+        if missing:
+            ok = False
+    return ok
+
+# -----------------------------------------------------------------------------
+# Reglages de seance : dataclass + persistence JSON legere + detection d'ecarts
+# -----------------------------------------------------------------------------
+
+@dataclass
+class SessionSettings:
+    subject_id: str = DEFAULT_SUBJECT_ID
+    language: str = "fr"
+    screen_diagonal_in: float = RECOMMENDED_DIAGONAL_IN
+    screen_width_cm: float = SCREEN_WIDTH_CM_DEFAULT
+    viewing_distance_cm: float = VIEWING_DISTANCE_CM_DEFAULT
+    screen_index: int = 0
+    axis_mode: str = "vertical"        # "vertical" -> angle_set 0 (Haut/Bas) ; "horizontal" -> angle_set 1 (Gauche/Droite)
+    fixation_h_deg: float = 0.0
+    fixation_v_deg: float = 0.0
+    stim_h_deg: float = 0.0            # neutre par defaut ; l'ecran de configuration force une saisie consciente
+    stim_v_deg: float = 0.0
+    n_trials: int = TOTAL_TRIALS_DEFAULT
+    show_precue: bool = True
+    pause_mode: int = 0                # 0, 1 ou 2 pauses
+
+    # Verification physique de calibration (voir run_calibration_check_screen) :
+    # NE PAS demander a chaque seance (demande explicitement le 27/08 -- MATLAB,
+    # lui, la redemande a chaque lancement sans exception) -- seulement la
+    # premiere fois, ou de nouveau si le PROFIL ECRAN REELLEMENT RESOLU (pas
+    # seulement les valeurs saisies) differe de celui pour lequel elle a ete
+    # confirmee la derniere fois. calibration_verified n'est vrai que si les 5
+    # champs calib_verified_* ci-dessous correspondent EXACTEMENT au profil
+    # resolu de la seance courante (voir run_setup_wizard) ; sinon on redemande.
+    calibration_verified: bool = False
+    calib_verified_width_px: int = 0
+    calib_verified_height_px: int = 0
+    calib_verified_diagonal_in: float = 0.0
+    calib_verified_width_cm: float = 0.0
+    calib_verified_distance_cm: float = 0.0
+
+    @property
+    def angle_set(self) -> int:
+        return 0 if self.axis_mode == "vertical" else 1
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "SessionSettings":
+        known = {f.name for f in fields(cls)}
+        filtered = {k: v for k, v in d.items() if k in known}
+        return cls(**filtered)
+
+
+def _load_json(path: str) -> dict:
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_json(path: str, data: dict, logger: Optional[logging.Logger] = None) -> bool:
+    """Ecrit un JSON de facon atomique (fichier temporaire + os.replace).
+    CORRIGE PAR RAPPORT AU PYTHON PRECEDENT (27/08, round 3) : auparavant,
+    aucune exception n'etait interceptee ici -- une erreur disque (droits
+    refuses, disque plein, chemin invalide) faisait planter l'appelant sans
+    aucune gestion. Contrairement a write_session_outputs (code E12, resultats
+    de seance patient, qui bascule vers un repertoire de secours), les 4
+    appelants de cette fonction n'ecrivent QUE des preferences/reglages --
+    jamais de donnees de seance. Un echec est donc seulement journalise (si un
+    logger est disponible ; certains appelants tournent avant toute
+    initialisation de logger, voir _ask_language_if_unknown) et n'interrompt
+    jamais l'appelant : le pire cas est un reglage non memorise pour la
+    prochaine fois, deja tolere silencieusement ailleurs (voir
+    load_last_settings, qui repart des valeurs par defaut si le fichier est
+    absent/corrompu). Retourne True si l'ecriture a reussi, False sinon."""
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False, sort_keys=True)
+        os.replace(tmp_path, path)
+        return True
+    except OSError as exc:
+        if logger is not None:
+            logger.warning("Echec d'ecriture de %s (reglage non memorise pour la prochaine fois) : %s", path, exc)
+        return False
+
+
+def load_last_settings(subject_id: str) -> Optional[SessionSettings]:
+    """Recharge les derniers reglages connus pour ce patient, ou None si premiere
+    utilisation / fichier corrompu (auquel cas on repart silencieusement des
+    valeurs par defaut plutot que de bloquer la seance)."""
+    store = _load_json(SETTINGS_FILE)
+    entry = store.get(subject_id)
+    if entry is None:
+        return None
+    try:
+        return SessionSettings.from_dict(entry)
+    except (TypeError, ValueError):
+        return None
+
+
+def save_settings(settings: SessionSettings, logger: Optional[logging.Logger] = None) -> None:
+    store = _load_json(SETTINGS_FILE)
+    store[settings.subject_id] = settings.to_dict()
+    _save_json(SETTINGS_FILE, store, logger)
+
+
+# Champs pour lesquels un ecart avec la derniere seance declenche une popup de
+# confirmation. subject_id/language sont volontairement exclus (choisis a chaque
+# lancement, un "ecart" n'a pas de sens la).
+_DIFF_WATCHED_FIELDS = [
+    "screen_diagonal_in", "screen_width_cm", "viewing_distance_cm", "screen_index",
+    "axis_mode", "fixation_h_deg", "fixation_v_deg", "stim_h_deg", "stim_v_deg",
+    "n_trials", "show_precue", "pause_mode",
+]
+
+_FIELD_LABEL_KEY = {
+    "screen_diagonal_in": "field_diagonal_in",
+    "screen_width_cm": "field_width_cm",
+    "viewing_distance_cm": "field_distance_cm",
+    "screen_index": "field_screen_choice",
+    "axis_mode": "field_axis",
+    "fixation_h_deg": "field_fix_h",
+    "fixation_v_deg": "field_fix_v",
+    "stim_h_deg": "field_stim_h",
+    "stim_v_deg": "field_stim_v",
+    "n_trials": "field_n_trials",
+    "show_precue": "field_precue",
+    "pause_mode": "field_pause_mode",
+}
+
+
+def diff_settings(old: Optional[SessionSettings], new: SessionSettings) -> List[Tuple[str, str, str]]:
+    """Retourne une liste (libelle_traduit, ancienne_valeur, nouvelle_valeur) pour
+    chaque champ surveille qui differe de la derniere seance de ce patient."""
+    if old is None:
+        return []
+    diffs = []
+    old_d, new_d = old.to_dict(), new.to_dict()
+    for key in _DIFF_WATCHED_FIELDS:
+        if old_d.get(key) != new_d.get(key):
+            diffs.append((key, str(old_d.get(key)), str(new_d.get(key))))
+    return diffs
+
+
+# -----------------------------------------------------------------------------
+# Compteur de seances par patient + nommage de fichiers lisible
+# -----------------------------------------------------------------------------
+
+def next_session_number(subject_id: str, logger: Optional[logging.Logger] = None) -> int:
+    """Incremente et persiste immediatement le compteur de seances du patient.
+    Appele uniquement une fois la seance definitivement confirmee (apres l'ecran
+    recapitulatif), pour qu'un setup abandonne ne consomme pas de numero."""
+    counters = _load_json(COUNTERS_FILE)
+    n = int(counters.get(subject_id, 0)) + 1
+    counters[subject_id] = n
+    _save_json(COUNTERS_FILE, counters, logger)
+    return n
+
+
+def build_output_basename(subject_id: str, session_num: int, timestamp: _dt.datetime) -> str:
+    """Nom de fichier lisible : SUJET_seanceNNN_AAAAMMJJ-HHMMSS (sans espace, sans
+    caractere special, trie chronologiquement et par sujet dans un dossier)."""
+    ts = timestamp.strftime("%Y%m%d-%H%M%S")
+    safe_id = "".join(c for c in subject_id if c.isalnum() or c in ("-", "_")) or DEFAULT_SUBJECT_ID
+    return f"{safe_id}_seance{session_num:03d}_{ts}"
+
+
+# -----------------------------------------------------------------------------
+# Journalisation (logs) par seance
+# -----------------------------------------------------------------------------
+
+def setup_logging(subject_id: str, session_num: int, timestamp: _dt.datetime) -> logging.Logger:
+    """Cree un fichier de log dedie a cette seance (utile pour le depannage a
+    distance : on peut demander au patient d'envoyer ce fichier). Le detail
+    complet (DEBUG) part dans le fichier ; seuls les messages INFO+ vont aussi
+    dans la console pour ne pas la noyer."""
+    log_dir = os.path.join(BASE_DIR, DATA_DIRNAME, LOGS_DIRNAME)
+    os.makedirs(log_dir, exist_ok=True)
+    basename = build_output_basename(subject_id, session_num, timestamp)
+    log_path = os.path.join(log_dir, basename + ".log")
+
+    logger = logging.getLogger(SOFTWARE_NAME)
+    logger.setLevel(logging.DEBUG)
+    logger.handlers.clear()
+    logger.propagate = False
+
+    fh = logging.FileHandler(log_path, encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logger.addHandler(fh)
+
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setLevel(logging.INFO)
+    sh.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+    logger.addHandler(sh)
+
+    logger.info("=== %s v%s -- nouvelle session ===", SOFTWARE_NAME, SOFTWARE_VERSION)
+    logger.info("Sujet=%s Seance n#%d Fichier log=%s", subject_id, session_num, log_path)
+    logger.info("Python=%s Plateforme=%s", sys.version.split()[0], platform.platform())
+    return logger
+
+
+def log_uncaught_exception(logger: logging.Logger, exc: BaseException) -> None:
+    logger.error("Exception non geree : %s", exc)
+    logger.error("%s", "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
+
+# -----------------------------------------------------------------------------
+# Calibration ecran : detection multi-moniteur, conversion deg<->px, garde-fous
+# -----------------------------------------------------------------------------
+# NOTE DE FIDELITE : la formule de conversion degres<->pixels ci-dessous reproduit
+# volontairement l'approximation lineaire "flat screen" utilisee par le MATLAB
+# d'origine (angle = atand(demi-largeur_cm / distance_cm), applique uniformement
+# sur tout l'ecran). Cette approximation sous-estime legerement l'angle reel aux
+# fortes excentricites (~10% d'erreur en bord d'ecran a distance rapprochee), mais
+# la corriger romprait la fidelite avec les seuils/normes obtenus avec le
+# programme MATLAB. A ne changer qu'apres discussion explicite.
+
+@dataclass
+class ScreenProfile:
+    screen_index: int
+    width_px: int
+    height_px: int
+    width_cm: float
+    height_cm: float
+    diagonal_in: float
+    viewing_distance_cm: float
+    px_per_deg: float
+    dot_size_px: float
+
+
+def _screen_matches(s, other) -> bool:
+    """Compare deux ecrans pyglet par VALEUR (largeur/hauteur/position), pas
+    par identite d'objet Python. CORRECTIF : get_screens() et
+    get_default_screen() peuvent (et, constate en pratique, le font) renvoyer
+    des INSTANCES DIFFERENTES pour le meme ecran physique -- un test `is`
+    echoue alors systematiquement, et TOUS les ecrans (y compris le veritable
+    ecran principal) se retrouvaient etiquetes "secondaire"."""
+    if other is None:
+        return False
+    return (getattr(s, "width", None) == getattr(other, "width", None)
+            and getattr(s, "height", None) == getattr(other, "height", None)
+            and getattr(s, "x", None) == getattr(other, "x", None)
+            and getattr(s, "y", None) == getattr(other, "y", None))
+
+
+def detect_screens() -> List[dict]:
+    """Enumere les ecrans disponibles via pyglet (necessaire pour le cas
+    ordinateur portable + ecran externe branche). Retourne toujours au moins un
+    element : en cas d'echec de detection, on retombe sur une valeur par defaut
+    plutot que de bloquer le lancement."""
+    try:
+        import pyglet
+        display = pyglet.canvas.get_display()
+        screens = display.get_screens()
+        try:
+            default_screen = display.get_default_screen()
+        except Exception:
+            default_screen = screens[0] if screens else None
+        out = []
+        for i, s in enumerate(screens):
+            out.append({
+                "index": i,
+                "width_px": int(s.width),
+                "height_px": int(s.height),
+                "x": int(s.x),
+                "y": int(s.y),
+                "is_primary": _screen_matches(s, default_screen),
+            })
+        if out:
+            if not any(o["is_primary"] for o in out):
+                # Filet de securite : si la comparaison par valeur ne trouve
+                # aucune correspondance (get_default_screen indisponible ou
+                # incoherent), ne jamais afficher une liste sans aucun ecran
+                # principal -- on retient le premier par defaut.
+                out[0]["is_primary"] = True
+            return out
+    except Exception:
+        pass
+    return [{
+        "index": 0, "width_px": MIN_RESOLUTION_PX[0], "height_px": MIN_RESOLUTION_PX[1],
+        "x": 0, "y": 0, "is_primary": True,
+    }]
+
+
+def validate_resolution(width_px: int, height_px: int) -> bool:
+    return width_px >= MIN_RESOLUTION_PX[0] and height_px >= MIN_RESOLUTION_PX[1]
+
+
+def classify_diagonal(diagonal_in: float) -> str:
+    """'reject' sous le seuil minimal absolu (22po), 'warn' sous la
+    recommandation (24po) mais au-dessus du seuil minimal, 'ok' sinon."""
+    if diagonal_in < MIN_DIAGONAL_IN:
+        return "reject"
+    if diagonal_in < RECOMMENDED_DIAGONAL_IN:
+        return "warn"
+    return "ok"
+
+
+def estimate_dpi(width_px: int, height_px: int, diagonal_in: float) -> float:
+    """Densite de pixels (points/pouce) impliquee par la resolution detectee et
+    la diagonale declaree par l'utilisateur. Heuristique de plausibilite
+    uniquement (voir note pres de MIN_PLAUSIBLE_DPI) : ne prouve pas qu'un ecran
+    est externe, mais detecte les combinaisons typiques d'une dalle
+    d'ordinateur portable declaree avec une diagonale exageree."""
+    if diagonal_in <= 0:
+        return 0.0
+    return math.sqrt(width_px ** 2 + height_px ** 2) / diagonal_in
+
+
+def is_dpi_plausible(dpi: float) -> bool:
+    return MIN_PLAUSIBLE_DPI <= dpi <= MAX_PLAUSIBLE_DPI
+
+
+# Sorties DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY (wingdi.h) considerees comme un
+# ecran INTERNE (dalle integree). D'apres la documentation Microsoft elle-meme :
+# "Values with 'embedded' in their names indicate that the [...] video output
+# device connects internally to the display device. In those cases, the
+# DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL value is redundant." -- autrement dit,
+# la plupart des portables recents (connecteur eDP) remontent EMBEDDED, pas
+# INTERNAL ; se limiter a INTERNAL manquerait la majorite du parc actuel.
+_WIN_INTERNAL_OUTPUT_TECHNOLOGIES = {
+    0x80000000,  # DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL
+    11,          # DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EMBEDDED (eDP -- portables recents)
+    13,          # DISPLAYCONFIG_OUTPUT_TECHNOLOGY_UDI_EMBEDDED
+    6,           # DISPLAYCONFIG_OUTPUT_TECHNOLOGY_LVDS (portables plus anciens)
+}
+
+
+def detect_windows_internal_display() -> Optional[bool]:
+    """Detection Windows REELLE (API CCD / QueryDisplayConfig, PAS une simple
+    declaration de l'utilisateur) de la presence d'un ecran interne (dalle
+    d'ordinateur portable) parmi les sorties actuellement actives.
+
+    Retourne True si au moins une sortie active est identifiee comme interne,
+    False si toutes les sorties actives sont clairement externes, ou None si
+    la detection est impossible ou peu fiable (plateforme non-Windows, API
+    absente, erreur quelconque) -- auquel cas l'appelant ne doit RIEN en
+    conclure et se rabattre sur la case a cocher / l'heuristique DPI.
+
+    AVERTISSEMENT DE FIABILITE : cette fonction s'appuie sur des structures
+    ctypes reconstruites a partir de la documentation Microsoft officielle
+    (DISPLAYCONFIG_PATH_INFO et ses sous-structures), mais n'a pas pu etre
+    executee sur une machine Windows reelle pendant le developpement (environnement
+    de developpement Linux sans affichage). Conformement au choix explicite de
+    l'utilisateur, le resultat n'est donc utilise QUE comme avertissement
+    supplementaire (jamais comme blocage dur) dans _ask_full_settings -- si cette
+    detection se trompe, la pire consequence est un avertissement a tort ou une
+    non-detection, jamais une application qui refuse de se lancer.
+
+    NOTE TECHNIQUE : les champs utilisent des types ctypes a largeur FIXE
+    (c_uint32/c_int32) plutot que ctypes.wintypes.DWORD/LONG/UINT/BOOL. Verifie
+    empiriquement pendant le developpement : ces alias wintypes correspondent a
+    C `long`/`unsigned long`, dont la taille depend de la plateforme (4 octets
+    sur Windows LLP64, mais 8 octets constates sur Linux LP64 dans ce sandbox de
+    developpement) -- un piege qui aurait fausse tout calcul de taille de
+    structure fait ou verifie en dehors d'un vrai Windows. Les types a largeur
+    fixe eliminent cette ambiguite quelle que soit la plateforme."""
+    if platform.system() != "Windows":
+        return None
+    try:
+        import ctypes
+
+        U32 = ctypes.c_uint32
+        I32 = ctypes.c_int32
+
+        class _Luid(ctypes.Structure):
+            _fields_ = [("LowPart", U32), ("HighPart", I32)]
+
+        class _Rational(ctypes.Structure):
+            _fields_ = [("Numerator", U32), ("Denominator", U32)]
+
+        class _PathSourceInfo(ctypes.Structure):
+            _fields_ = [
+                ("adapterId", _Luid), ("id", U32),
+                ("modeInfoIdxUnion", U32),  # union UINT32 <-> bitfields, meme taille
+                ("statusFlags", U32),
+            ]
+
+        class _PathTargetInfo(ctypes.Structure):
+            _fields_ = [
+                ("adapterId", _Luid), ("id", U32),
+                ("modeInfoIdxUnion", U32),
+                ("outputTechnology", U32),
+                ("rotation", U32), ("scaling", U32),
+                ("refreshRate", _Rational), ("scanLineOrdering", U32),
+                ("targetAvailable", I32), ("statusFlags", U32),
+            ]
+
+        class _PathInfo(ctypes.Structure):
+            _fields_ = [
+                ("sourceInfo", _PathSourceInfo), ("targetInfo", _PathTargetInfo),
+                ("flags", U32),
+            ]
+
+        QDC_ONLY_ACTIVE_PATHS = 0x00000002
+        ERROR_SUCCESS = 0
+        ERROR_INSUFFICIENT_BUFFER = 122
+
+        user32 = ctypes.windll.user32
+        user32.GetDisplayConfigBufferSizes.argtypes = [
+            U32, ctypes.POINTER(U32), ctypes.POINTER(U32)]
+        user32.GetDisplayConfigBufferSizes.restype = I32
+        user32.QueryDisplayConfig.argtypes = [
+            U32, ctypes.POINTER(U32), ctypes.POINTER(_PathInfo),
+            ctypes.POINTER(U32), ctypes.c_void_p, ctypes.c_void_p]
+        user32.QueryDisplayConfig.restype = I32
+
+        path_count = U32(0)
+        mode_count = U32(0)
+        for _attempt in range(3):
+            rc = user32.GetDisplayConfigBufferSizes(
+                QDC_ONLY_ACTIVE_PATHS, ctypes.byref(path_count), ctypes.byref(mode_count))
+            if rc != ERROR_SUCCESS:
+                return None
+            path_array = (_PathInfo * max(1, path_count.value))()
+            # DISPLAYCONFIG_MODE_INFO n'est jamais lu par ce code -- seule sa
+            # TAILLE compte, pour que Windows dispose d'assez de place pour
+            # ecrire. Plutot que de reconstruire de memoire toute la hierarchie
+            # de structures imbriquees (DISPLAYCONFIG_TARGET_MODE / SOURCE_MODE /
+            # DESKTOP_IMAGE_INFO, ~64 octets documentes), on sur-alloue
+            # largement (128 octets/element) : une sous-estimation de cette
+            # taille serait le principal risque reel de corruption memoire de
+            # cette fonction, donc on l'elimine par une marge large plutot que
+            # par une exactitude qu'on ne peut pas verifier dans cet environnement.
+            mode_buf = ctypes.create_string_buffer(max(1, mode_count.value) * 128)
+            rc = user32.QueryDisplayConfig(
+                QDC_ONLY_ACTIVE_PATHS, ctypes.byref(path_count), path_array,
+                ctypes.byref(mode_count), mode_buf, None)
+            if rc == ERROR_INSUFFICIENT_BUFFER:
+                continue  # la config a change entre les deux appels : on reessaie
+            if rc != ERROR_SUCCESS:
+                return None
+            found_internal = False
+            found_external = False
+            for i in range(path_count.value):
+                tech = path_array[i].targetInfo.outputTechnology
+                if tech in _WIN_INTERNAL_OUTPUT_TECHNOLOGIES:
+                    found_internal = True
+                else:
+                    found_external = True
+            if found_internal:
+                return True
+            if found_external:
+                return False
+            return None
+        return None
+    except Exception:
+        return None
+
+
+def estimate_width_cm_from_diagonal(diagonal_in: float, width_px: int, height_px: int) -> float:
+    """Estime la largeur physique (cm) a partir de la diagonale saisie et du
+    ratio d'aspect de la resolution detectee.
+
+    CORRECTIF (round 4, 27/08) : jusqu'au round precedent, laisser la
+    largeur physique a 0 dans le formulaire invoquait explicitement cette
+    estimation (libelle "laisser 0 pour estimer") -- retire a la demande de
+    l'utilisateur, une mesure physique reelle est desormais obligatoire (voir
+    _ask_full_settings, validation width_cm<=0). Cette fonction et son unique
+    appelant (build_screen_profile) sont conserves tels quels UNIQUEMENT comme
+    filet de securite pour d'anciens reglages deja sauvegardes avant ce
+    correctif (fichier settings.json avec width_cm=0) -- sans ce filet,
+    compute_px_per_deg diviserait par une largeur nulle (ZeroDivisionError) au
+    prochain lancement silencieux de ce patient. Plus jamais atteignable
+    depuis le formulaire pour une nouvelle saisie."""
+    diagonal_cm = diagonal_in * 2.54
+    aspect = (width_px / height_px) if height_px else (DEFAULT_ASPECT_W / DEFAULT_ASPECT_H)
+    width_cm = diagonal_cm / math.sqrt(1.0 + (1.0 / aspect) ** 2)
+    return width_cm
+
+
+def compute_px_per_deg(screen_width_cm: float, viewing_distance_cm: float, screen_width_px: int) -> float:
+    """Reproduit exactement scale_factor = atand(largeur/2/distance)*60/(resX/2)
+    du MATLAB d'origine, reformule en pixels-par-degre."""
+    half_width_deg = math.degrees(math.atan((screen_width_cm / 2.0) / viewing_distance_cm))
+    arcmin_per_px = (half_width_deg * 60.0) / (screen_width_px / 2.0)
+    deg_per_px = arcmin_per_px / 60.0
+    return 1.0 / deg_per_px
+
+
+def deg2px(deg: float, px_per_deg: float) -> float:
+    return deg * px_per_deg
+
+
+def px2deg(px: float, px_per_deg: float) -> float:
+    return px / px_per_deg
+
+
+def compute_dot_size_px(px_per_deg: float) -> float:
+    dot_size_deg = DOT_SIZE_ARCMIN / 60.0
+    return dot_size_deg * px_per_deg
+
+
+def check_stimulus_fits(px_per_deg: float, screen_width_px: int, screen_height_px: int,
+                         stim_h_deg: float, stim_v_deg: float) -> dict:
+    """Verifie que le stimulus (centre du patch + rayon d'aperture) reste
+    entierement dans le champ visible, sur les deux axes."""
+    half_w_deg = (screen_width_px / 2.0) / px_per_deg
+    half_h_deg = (screen_height_px / 2.0) / px_per_deg
+    needed_h = abs(stim_h_deg) + APERTURE_RADIUS_DEG
+    needed_v = abs(stim_v_deg) + APERTURE_RADIUS_DEG
+    return {
+        "ok": (needed_h <= half_w_deg) and (needed_v <= half_h_deg),
+        "half_w_deg": half_w_deg,
+        "half_h_deg": half_h_deg,
+        "needed_h_deg": needed_h,
+        "needed_v_deg": needed_v,
+    }
+
+
+def build_screen_profile(screen_index: int, width_px: int, height_px: int,
+                          diagonal_in: float, width_cm_input: float,
+                          viewing_distance_cm: float) -> ScreenProfile:
+    """Construit un profil ecran complet a partir des saisies utilisateur,
+    en estimant la largeur physique si necessaire."""
+    if width_cm_input and width_cm_input > 0:
+        width_cm = width_cm_input
+        height_cm = width_cm * (height_px / width_px)
+    else:
+        width_cm = estimate_width_cm_from_diagonal(diagonal_in, width_px, height_px)
+        height_cm = width_cm * (height_px / width_px)
+    px_per_deg = compute_px_per_deg(width_cm, viewing_distance_cm, width_px)
+    dot_px = compute_dot_size_px(px_per_deg)
+    return ScreenProfile(
+        screen_index=screen_index, width_px=width_px, height_px=height_px,
+        width_cm=width_cm, height_cm=height_cm, diagonal_in=diagonal_in,
+        viewing_distance_cm=viewing_distance_cm, px_per_deg=px_per_deg, dot_size_px=dot_px,
+    )
+
+# -----------------------------------------------------------------------------
+# Geometrie direction/orientation/touche-reponse (coeur scientifique du script)
+# -----------------------------------------------------------------------------
+# Reproduit fidelement les lignes 373-428 de HuxlinLabFBAtraining.m :
+#   direction   in {1,2}      (ci-dessous : base_side)   -- tirage 50/50
+#   orientation in {-1,+1}    (ci-dessous : tilt_sign)    -- tirage 50/50 independant
+#   angle = f(angle_set, base_side) + angle_deviationP * tilt_sign   (convention
+#           Psychtoolbox : 0=+x, +y=BAS, angle croissant = rotation "horaire" a
+#           l'ecran)
+#
+# IMPORTANT -- lu et re-verifie ligne a ligne sur le MATLAB d'origine : la table
+# de correspondance angle_set=1 (reponse Gauche/Droite) de HuxlinLabFBAtraining.m
+# est elle-meme INCOHERENTE pour base_side==2 (le mouvement affiche part parfois
+# a gauche alors que la touche jugee correcte est Droite, et vice-versa -- verifie
+# par calcul direct : angle=90+85=175 deg -> vecteur (-0.996,+0.087) = mouvement
+# VISUELLEMENT VERS LA GAUCHE, alors que le code MATLAB attend la touche Droite
+# pour orientation=+1 dans ce cas). Ce script ne reproduit PAS cette table par
+# copie : la touche correcte est TOUJOURS deduite geometriquement du vecteur
+# reellement affiche (vx,vy ci-dessous), ce qui la rend automatiquement
+# coherente pour les DEUX modes (angle_set 0 et 1), sans avoir a trancher quelle
+# moitie d'une table auto-contradictoire serait "la bonne". Comme angle_set=1
+# n'est utilise qu'occasionnellement en pratique (cf. echanges avec
+# l'utilisateur), cet ecart deliberement assume vis-a-vis de MATLAB est sans
+# risque et strictement une amelioration (aucun patient ne doit voir une
+# consigne clavier qui contredit ce qu'il voit a l'ecran).
+#
+# Pour angle_set=0 (Haut/Bas, le mode reellement utilise), la meme verification
+# ligne a ligne confirme que MATLAB est deja parfaitement auto-coherent dans les
+# 4 cas -- la regle geometrique ci-dessous reproduit donc EXACTEMENT le
+# comportement MATLAB pour ce mode, pas seulement un choix "raisonnable".
+#
+# Convention de ce script : vx,vy sont calcules directement comme
+# cos(angle)/sin(angle) SANS inversion de signe, et utilises tels quels aussi
+# bien pour le rendu (deplacement des points, en unites PsychoPy +y=HAUT) que
+# pour la deduction de la touche correcte. Le sens visuel resultant pour un
+# couple (base_side,tilt_sign) donne est donc en "miroir vertical" par rapport
+# a MATLAB -- verifie SANS CONSEQUENCE par l'utilisateur sur plusieurs dizaines
+# de sessions (voir echanges) : rendu et notation restent toujours coherents
+# entre eux, et les proportions Haut/Bas (ou Gauche/Droite) restent 50/50. Ne
+# pas modifier ce choix sans en rediscuter explicitement.
+
+@dataclass
+class TrialDirection:
+    base_side: int          # 1 ou 2 (MATLAB "direction")
+    tilt_sign: int           # -1 ou +1 (MATLAB "orientation")
+    angle_dev_deg: float      # difficulte de cet essai (angle_deviationP)
+    angle_deg: float          # angle absolu, convention Psychtoolbox (voir ci-dessus)
+    vx: float                  # composante x du vecteur unitaire, convention PsychoPy (+x=droite)
+    vy: float                  # composante y du vecteur unitaire, convention PsychoPy (+y=HAUT)
+    correct_key: str
+    incorrect_key: str
+
+
+def compute_trial_direction(angle_set: int, base_side: int, tilt_sign: int, angle_dev_deg: float) -> TrialDirection:
+    if angle_set == 0 and base_side == 1:
+        angle_deg = 0.0 + angle_dev_deg * tilt_sign
+    elif angle_set == 0 and base_side == 2:
+        angle_deg = 180.0 + angle_dev_deg * tilt_sign
+    elif angle_set == 1 and base_side == 1:
+        angle_deg = 270.0 + angle_dev_deg * tilt_sign
+    else:
+        angle_deg = 90.0 + angle_dev_deg * tilt_sign
+
+    angle_rad = math.radians(angle_deg)
+    vx = math.cos(angle_rad)
+    vy = math.sin(angle_rad)
+
+    if angle_set == 0:
+        correct_key, incorrect_key = ("up", "down") if vy > 0 else ("down", "up")
+    else:
+        correct_key, incorrect_key = ("right", "left") if vx > 0 else ("left", "right")
+
+    return TrialDirection(
+        base_side=base_side, tilt_sign=tilt_sign, angle_dev_deg=angle_dev_deg,
+        angle_deg=angle_deg, vx=vx, vy=vy, correct_key=correct_key, incorrect_key=incorrect_key,
+    )
+
+
+def compute_precue_geometry(base_side: int, angle_dev_deg: float,
+                             screen_width_px: int) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+    """Reproduit les deux Screen('DrawLine', ...) de la precue en chevron de
+    HuxlinLabFBAtraining.m (mise a jour du 10/05/21, lignes 484-495) : deux
+    segments DROITS partageant un point de depart (le point de fixation),
+    dont l'ouverture (ecart angulaire par rapport a l'horizontale) est dans
+    le MATLAB d'origine directement angle_dev_deg -- SANS plancher reel (le
+    seul code de "plancher" du fichier source, la variable `yy` aux lignes
+    477-482, est calcule mais jamais lu ensuite ; le rendu du chevron utilise
+    bien angle_deviationP brut). Le cue pointe a DROITE quand base_side==1, a
+    GAUCHE quand base_side==2 -- ceci est INCONDITIONNEL par rapport a
+    angle_set dans le MATLAB d'origine (le code de la precue ne teste jamais
+    angle_set), et ce script reproduit fidelement cette meme absence de
+    branchement plutot que d'inventer un comportement "vertical" que MATLAB
+    n'a jamais eu.
+
+    DEVIATION ASSUMEE (voir PRECUE_MIN_OPENING_DEG) : contrairement au MATLAB
+    source, l'angle utilise pour l'OUVERTURE VISUELLE du chevron est plafonne
+    a PRECUE_MIN_OPENING_DEG -- demande explicitement apres qu'un test reel a
+    confirme que la fidelite stricte (chevron qui retrecit jusqu'a 0.5 deg,
+    les deux segments se confondant visuellement) rendait la precue peu
+    lisible aux essais difficiles. Ce plancher n'affecte QUE la geometrie du
+    cue ; angle_deg (la vraie direction du mouvement affiche, calculee dans
+    compute_trial_direction) reste exactement fidele au niveau de difficulte
+    du staircase, sans aucun plancher.
+
+    Retourne les deux points d'arrivee des segments (bras superieur, bras
+    inferieur) EN PIXELS, relatifs a la fixation, convention PsychoPy
+    (+x=droite, +y=haut). CORRECTIF DE FIDELITE (independant du point
+    ci-dessus) : la formule MATLAB d'origine (resolution(1)/cue_scale) est
+    NATIVEMENT en pixels ; ce script gardait par erreur une conversion
+    superflue vers les degres (division par px_per_deg) alors que le point
+    d'appel additionnait ensuite ce resultat directement a une position deja
+    en pixels -- ce qui reduisait la precue a une fraction de pixel, donc
+    invisible a l'ecran. La fonction travaille desormais en pixels de bout en
+    bout, sans aucune conversion, exactement comme MATLAB.
+
+    DEVIATION ASSUMEE (voir PRECUE_LENGTH_MULTIPLIER) : la longueur des bras
+    (r_px) est ensuite multipliee par ce facteur -- demande explicitement le
+    27/08 pour ameliorer la lisibilite. La formule MATLAB fidele
+    (resolution(1)/cue_scale) reste calculee en premier et clairement isolee
+    ci-dessous ; seul le resultat final est mis a l'echelle."""
+    side = 1.0 if base_side == 1 else -1.0
+    r_px = (screen_width_px / CUE_SCALE) * PRECUE_LENGTH_MULTIPLIER
+    opening_deg = max(angle_dev_deg, PRECUE_MIN_OPENING_DEG)
+    dev_rad = math.radians(opening_deg)
+    dx = side * r_px * math.cos(dev_rad)
+    dy = r_px * math.sin(dev_rad)
+    return (dx, dy), (dx, -dy)
+
+
+def run_self_consistency_check() -> None:
+    """Garde-fou de non-regression execute au demarrage (voir main()) : pour les
+    8 combinaisons possibles de (angle_set, base_side, tilt_sign), verifie que
+    la touche jugee correcte correspond bien au signe reel du vecteur affiche
+    (vy pour l'axe vertical, vx pour l'axe horizontal), et que la repartition
+    Haut/Bas (resp. Gauche/Droite) est bien equilibree 2/2 sur les 4 cas de
+    chaque mode. Cette propriete est vraie par construction (le meme calcul
+    alimente le rendu ET le jugement) -- ce test sert a empecher qu'une
+    modification future ne casse ce lien (ex. en codant en dur une table de
+    correspondance plutot qu'en la deduisant du vecteur reel), ce qui serait
+    decouvert ici au demarrage plutot que par un patient en seance."""
+    counts = {"up": 0, "down": 0, "left": 0, "right": 0}
+    for angle_set in (0, 1):
+        for base_side in (1, 2):
+            for tilt_sign in (-1, 1):
+                td = compute_trial_direction(angle_set, base_side, tilt_sign, 45.0)
+                if td.correct_key == td.incorrect_key:
+                    raise AssertionError(f"correct_key == incorrect_key pour {td!r}")
+                if angle_set == 0:
+                    if td.correct_key not in ("up", "down"):
+                        raise AssertionError(f"touche inattendue pour angle_set=0 : {td!r}")
+                    if (td.vy > 0) != (td.correct_key == "up"):
+                        raise AssertionError(f"Incoherence vy/touche : {td!r}")
+                else:
+                    if td.correct_key not in ("left", "right"):
+                        raise AssertionError(f"touche inattendue pour angle_set=1 : {td!r}")
+                    if (td.vx > 0) != (td.correct_key == "right"):
+                        raise AssertionError(f"Incoherence vx/touche : {td!r}")
+                counts[td.correct_key] += 1
+    if not (counts["up"] == counts["down"] == 2):
+        raise AssertionError(f"Desequilibre Haut/Bas : {counts!r}")
+    if not (counts["left"] == counts["right"] == 2):
+        raise AssertionError(f"Desequilibre Gauche/Droite : {counts!r}")
+
+
+def run_geometry_roundtrip_check() -> None:
+    """Verifie que deg2px/px2deg sont bien inverses l'une de l'autre, pour
+    detecter toute regression future dans les helpers de conversion."""
+    px_per_deg = compute_px_per_deg(SCREEN_WIDTH_CM_DEFAULT, VIEWING_DISTANCE_CM_DEFAULT, MIN_RESOLUTION_PX[0])
+    for deg in (0.0, 0.5, 2.5, 10.0, -7.3):
+        px = deg2px(deg, px_per_deg)
+        back = px2deg(px, px_per_deg)
+        if abs(back - deg) > SELF_TEST_TOLERANCE * max(1.0, abs(deg)) * 1e6:
+            raise AssertionError(f"Aller-retour deg<->px incoherent pour {deg} : {back}")
+
+
+def run_startup_self_tests(logger: Optional[logging.Logger] = None) -> None:
+    """Point d'entree unique des auto-tests executes a chaque lancement, avant
+    l'ouverture de la fenetre PsychoPy. Toute levee d'exception ici doit
+    empecher le demarrage de la seance (mieux vaut un plantage explicite au
+    lancement qu'une seance scientifiquement invalide)."""
+    run_self_consistency_check()
+    run_geometry_roundtrip_check()
+    if not translations_are_complete():
+        raise AssertionError("Dictionnaire de traduction incomplet (voir translations_are_complete).")
+    if logger is not None:
+        logger.info("Auto-tests de demarrage : OK (coherence direction/touche, geometrie, traductions).")
+
+# -----------------------------------------------------------------------------
+# Stimulus RDK (Random Dot Kinematogram) -- coherence globale 100% ("Tilt_Global")
+# -----------------------------------------------------------------------------
+# Reproduit fidelement les lignes 244-256 et 509-552 de HuxlinLabFBAtraining.m,
+# y compris des details d'implementation qui n'ont pas d'impact statistique
+# demontrable mais sont repris pour eliminer tout ecart residuel :
+#  - le carre d'echantillonnage/rejet fait bps = 2*rayon+1 px (pas 2*rayon) ;
+#  - le "wrap" aux bords utilise une chaine if/elif/elif/elif (un seul axe
+#    corrige par point et par frame, jamais les deux) ;
+#  - la duree de vie des points (lifetime) reste un nombre de frames FLOTTANT
+#    (pas arrondi), compare avec > a un age entier -- exactement comme
+#    `age{j}(i) > lifetime` en MATLAB ;
+#  - le mouvement (vx,vy) est rigoureusement IDENTIQUE pour tous les points
+#    (normrnd(0,0,...) = zero variance = coherence globale a 100%, PAS de bruit
+#    directionnel point-a-point -- c'est ce qui distingue "Tilt_Global" de
+#    Coarse_dots).
+
+def compute_n_dots(aperture_radius_deg: float, dot_density_per_deg2: float) -> int:
+    return int(round((aperture_radius_deg ** 2) * math.pi * dot_density_per_deg2))
+
+
+def generate_initial_dot_state(n_dots: int, radius_px: float, lifetime_frames: float) -> Tuple[np.ndarray, np.ndarray]:
+    """positions{1} / age{1} : tirage uniforme par rejet dans le disque
+    d'aperture, age initial uniforme entre 1 et lifetime_frames (evite un
+    "pouls" synchrone de tous les points a la meme frame)."""
+    bps = radius_px * 2.0 + 1.0
+    positions = np.zeros((n_dots, 2), dtype=float)
+    for i in range(n_dots):
+        while True:
+            x = (np.random.rand() - 0.5) * bps
+            y = (np.random.rand() - 0.5) * bps
+            if x * x + y * y <= radius_px * radius_px:
+                positions[i, 0] = x
+                positions[i, 1] = y
+                break
+    ages = np.ceil(np.random.rand(n_dots) * max(lifetime_frames, 1.0))
+    ages = np.maximum(ages, 1.0)
+    return positions, ages
+
+
+def advance_dot_frame(positions: np.ndarray, ages: np.ndarray, vx_unit: float, vy_unit: float,
+                       step_px: float, radius_px: float, lifetime_frames: float) -> Tuple[np.ndarray, np.ndarray]:
+    """Calcule positions{j}/age{j} a partir de positions{j-1}/age{j-1} (une
+    frame de mouvement), en reproduisant l'ordre exact des operations des
+    lignes 523-552 : deplacement -> vieillissement -> respawn si trop vieux ->
+    wrap (if/elif) -> rejet-et-redraw si toujours hors du disque."""
+    bps = radius_px * 2.0 + 1.0
+    n_dots = positions.shape[0]
+    new_positions = np.empty_like(positions)
+    new_ages = np.empty_like(ages)
+    for i in range(n_dots):
+        x = positions[i, 0] + step_px * vx_unit
+        y = positions[i, 1] + step_px * vy_unit
+        age = ages[i] + 1.0
+
+        if age > lifetime_frames:
+            x = (np.random.rand() - 0.5) * bps
+            y = (np.random.rand() - 0.5) * bps
+            age = 1.0
+
+        if x > radius_px:
+            x -= bps
+        elif x < -radius_px:
+            x += bps
+        elif y > radius_px:
+            y -= bps
+        elif y < -radius_px:
+            y += bps
+
+        if x * x + y * y > radius_px * radius_px:
+            while True:
+                rx = (np.random.rand() - 0.5) * bps
+                ry = (np.random.rand() - 0.5) * bps
+                if rx * rx + ry * ry <= radius_px * radius_px:
+                    x, y = rx, ry
+                    break
+
+        new_positions[i, 0] = x
+        new_positions[i, 1] = y
+        new_ages[i] = age
+    return new_positions, new_ages
+
+
+def precompute_trial_frames(n_dots: int, radius_px: float, lifetime_frames: float, vx_unit: float,
+                             vy_unit: float, step_px: float, mv_length: int) -> List[np.ndarray]:
+    """Precalcule la totalite des positions de la frame 1 (statique, comme
+    MATLAB : positions{1} n'est jamais deplace) a la frame mv_length. Ce calcul
+    est fait EN UNE FOIS, avant le debut de l'animation, pour pouvoir etre
+    absorbe dans le delai d'ISI compense (voir run_trial) exactement comme
+    MATLAB le fait avant son "Finish the ITI"."""
+    positions, ages = generate_initial_dot_state(n_dots, radius_px, lifetime_frames)
+    frames = [positions.copy()]
+    for _ in range(2, mv_length + 1):
+        positions, ages = advance_dot_frame(positions, ages, vx_unit, vy_unit, step_px, radius_px, lifetime_frames)
+        frames.append(positions.copy())
+    return frames
+
+
+# -----------------------------------------------------------------------------
+# Staircases 3-descendant / 1-montant entrelacees
+# -----------------------------------------------------------------------------
+# Reproduit fidelement les lignes 322-328 (repartition + mixage fixe des essais
+# entre les 3 staircases) et 430-462 / 595-636 (regle de progression) de
+# HuxlinLabFBAtraining.m. Point de fidelite important, verifie ligne a ligne :
+# en MATLAB, le passage au niveau superieur apres 3 succes consecutifs n'est
+# APPLIQUE qu'au prochain passage sur cette meme staircase (pas au moment du
+# 3e succes lui-meme), alors qu'un echec fait immediatement reculer le niveau,
+# des la reponse. Les deux fonctions ci-dessous respectent cette asymetrie de
+# timing plutot que de fusionner les deux mises a jour au meme moment.
+
+def build_stair_sequence(n_trials_per_staircase: int, n_staircases: int = N_STAIRCASES) -> List[int]:
+    """Reproduit stair_array : n_trials_per_staircase copies de chaque
+    staircase (1..n_staircases), puis un unique melange global -- une sequence
+    fixe pour toute la seance ou chaque staircase apparait exactement
+    n_trials_per_staircase fois (pas un tirage aleatoire independant par essai,
+    qui ne garantirait pas l'egalite des effectifs)."""
+    seq: List[int] = []
+    for s in range(1, n_staircases + 1):
+        seq.extend([s] * n_trials_per_staircase)
+    np.random.shuffle(seq)
+    return seq
+
+
+def maybe_advance_staircase(stair_idxs: List[int], streak_counts: List[int], which_stair: int, n_levels: int) -> None:
+    """A appeler en tout DEBUT de traitement d'un essai, avant de lire la
+    difficulte de CET essai (lignes 430-451 de HuxlinLabFBAtraining.m)."""
+    idx = which_stair - 1
+    if streak_counts[idx] == STAIRCASE_UP_STREAK:
+        stair_idxs[idx] = min(stair_idxs[idx] + 1, n_levels - 1)
+        streak_counts[idx] = 0
+
+
+def record_staircase_response(stair_idxs: List[int], streak_counts: List[int], which_stair: int,
+                               correct: bool, n_levels: int) -> None:
+    """A appeler juste apres avoir note la reponse (lignes 595-636). Echec ->
+    niveau plus facile IMMEDIATEMENT (plancher = niveau 0). Succes -> incremente
+    seulement le compteur de serie ; le passage au niveau superieur est
+    applique au prochain passage sur cette staircase (maybe_advance_staircase)."""
+    idx = which_stair - 1
+    if correct:
+        streak_counts[idx] += 1
+    else:
+        stair_idxs[idx] = max(stair_idxs[idx] - 1, 0)
+        streak_counts[idx] = 0
+
+# -----------------------------------------------------------------------------
+# NOTE DE FIDELITE IMPORTANTE -- unites PsychoPy utilisees dans toute la suite
+# -----------------------------------------------------------------------------
+# PsychoPy convertit nativement ses unites 'deg' vers les pixels avec une formule
+# EXACTE en tangente (deg2cm = distance*tan(radians(deg))), differente de
+# l'approximation lineaire "ecran plat" utilisee par MATLAB et reproduite dans
+# compute_px_per_deg() ci-dessus. Pour eviter tout ecart, meme infime, entre "ou
+# PsychoPy pense qu'un degre se trouve" et "ou ce script pense qu'un degre se
+# trouve", TOUTE la geometrie (positions, tailles, cue) est calculee explicitement
+# en pixels via deg2px()/px2deg() (formule MATLAB), et TOUS les stimuli PsychoPy
+# sont crees avec units='pix'. Les unites 'deg' natives de PsychoPy ne sont
+# JAMAIS utilisees pour le rendu, uniquement pour l'affichage/la saisie cote
+# utilisateur (dialogues, resume).
+
+
+def compute_calibration_check(profile: "ScreenProfile", settings: "SessionSettings") -> Dict[str, float]:
+    """Reproduit le calcul de verification physique de l'ecran d'accueil MATLAB
+    (test_size/test_size2, lignes 343-344) : taille de la zone de stimulation et
+    distance fixation->stimulus, en cm et en pouces, pour verification a la
+    regle par le patient/l'accompagnant."""
+    aperture_diam_px = 2.0 * deg2px(APERTURE_RADIUS_DEG, profile.px_per_deg)
+    px_per_cm = profile.width_px / profile.width_cm
+    box_cm = aperture_diam_px / px_per_cm
+    box_in = box_cm * 0.3937
+
+    fix_x_px = deg2px(settings.fixation_h_deg, profile.px_per_deg)
+    fix_y_px = deg2px(settings.fixation_v_deg, profile.px_per_deg)
+    stim_x_px = deg2px(settings.stim_h_deg, profile.px_per_deg)
+    stim_y_px = deg2px(settings.stim_v_deg, profile.px_per_deg)
+    line_px = math.hypot(stim_x_px - fix_x_px, stim_y_px - fix_y_px)
+    line_cm = line_px / px_per_cm
+    line_in = line_cm * 0.3937
+
+    return {"box_cm": box_cm, "box_in": box_in, "line_cm": line_cm, "line_in": line_in}
+
+
+def compute_actual_trial_counts(requested_total: int, n_staircases: int = N_STAIRCASES) -> Tuple[int, int]:
+    """Le nombre total d'essais demande par l'utilisateur est ajuste au multiple
+    de n_staircases le plus proche (chaque staircase doit recevoir exactement le
+    meme nombre d'essais, comme n_trials*n_staircases en MATLAB). Retourne
+    (essais_par_staircase, total_reel)."""
+    per_staircase = max(1, round(requested_total / n_staircases))
+    return per_staircase, per_staircase * n_staircases
+
+
+def compute_pause_trial_indices(pause_mode: int, total_trials: int) -> List[int]:
+    """Fonctionnalite nouvelle (absente de MATLAB) : indices d'essai (1-based)
+    APRES lesquels une pause programmee est proposee."""
+    if pause_mode == 1:
+        return [total_trials // 2]
+    if pause_mode == 2:
+        return [total_trials // 3, (2 * total_trials) // 3]
+    return []
+
+
+@dataclass
+class TrialRecord:
+    trial: int
+    staircase_id: int
+    angle_dev_deg: float
+    base_side: int
+    tilt_sign: int
+    angle_deg: float
+    correct_key: str
+    key_pressed: str
+    is_correct: int
+    rt_s: float
+    # AJOUT PAR RAPPORT A MATLAB (27/08) : 1 si check_movement_timing() a
+    # detecte un ecart de cadence significatif pendant l'affichage du
+    # mouvement de cet essai, 0 sinon. Voir TIMING_ANOMALY_THRESHOLD.
+    timing_anomaly: int = 0
+
+
+@dataclass
+class SessionOutcome:
+    trials: List[TrialRecord] = field(default_factory=list)
+    aborted: bool = False
+    error: Optional[str] = None
+    total_time_s: float = 0.0
+    total_trials_planned: int = 0
+    final_stair_idxs: List[int] = field(default_factory=list)
+    frame_rate_measured: float = 0.0
+    calibration_check: Dict[str, float] = field(default_factory=dict)
+    # AJOUTS PAR RAPPORT A MATLAB (27/08), voir run_performance_check /
+    # check_power_source_change : perf_check_failed = la seance n'a pas
+    # demarre car la verification initiale de performance a echoue (E10) ;
+    # power_source_changed = un changement secteur/batterie a ete detecte
+    # pendant la seance reelle (E11, avertissement non bloquant).
+    perf_check_failed: bool = False
+    power_source_changed: bool = False
+
+    @property
+    def n_completed(self) -> int:
+        return len(self.trials)
+
+    @property
+    def n_correct(self) -> int:
+        return sum(r.is_correct for r in self.trials)
+
+    @property
+    def accuracy_percent(self) -> float:
+        return (100.0 * self.n_correct / self.n_completed) if self.trials else float("nan")
+
+    @property
+    def final_threshold_deg(self) -> float:
+        if not self.final_stair_idxs:
+            return float("nan")
+        return float(np.mean([ANGLE_RANGE_DEG[i] for i in self.final_stair_idxs]))
+
+
+@dataclass
+class TrialRunResult:
+    """Resultat d'un essai unique execute par la fermeture run_one_trial(),
+    partagee entre la boucle d'essais reels et run_performance_check() (essais
+    d'echauffement) -- AJOUT PAR RAPPORT A MATLAB (27/08), voir run_session."""
+    quit_requested: bool
+    key_pressed: str
+    rt_s: float
+    correct: bool
+    angle_deg: float
+    correct_key: str
+    trial_paused_s: float
+    movement_duration_s: float
+    timing_anomaly: bool
+
+
+def build_session_sounds(logger: Optional[logging.Logger] = None) -> Dict[str, object]:
+    """Construit les tonalites de retour. En cas d'echec d'initialisation audio
+    (pas de peripherique de son disponible), retourne des valeurs None : la
+    seance continue silencieusement plutot que de planter -- l'audio est juge
+    non essentiel a la validite de l'exercice (retour visuel deja present a
+    l'ecran). AJOUT PAR RAPPORT A MATLAB (27/08) : l'echec est desormais
+    journalise (code E13) au lieu d'etre totalement silencieux, suite a une
+    demande explicite de repertorier "tout autre erreur commune (meme
+    probleme son, ou audio...)". Toujours pas de popup : voir constante
+    ERR_CODE_AUDIO."""
+    out: Dict[str, object] = {}
+    for key, freq, dur in (
+        ("start", START_TONE_HZ, 0.05),
+        ("correct", CORRECT_TONE_HZ, 0.12),
+        ("incorrect", INCORRECT_TONE_HZ, 0.12),
+        ("pause", PAUSE_TONE_HZ, PAUSE_TONE_DURATION_S),
+    ):
+        try:
+            out[key] = sound.Sound(value=freq, secs=dur)
+        except Exception as exc:
+            out[key] = None
+            if logger is not None:
+                logger.warning("[%s] Peripherique audio indisponible pour le son '%s' : %s", ERR_CODE_AUDIO, key, exc)
+    return out
+
+
+def _play(snd: object, logger: Optional[logging.Logger] = None) -> None:
+    if snd is not None:
+        try:
+            snd.play()  # type: ignore[attr-defined]
+        except Exception as exc:
+            if logger is not None:
+                logger.warning("[%s] Echec de lecture d'un son de retour : %s", ERR_CODE_AUDIO, exc)
+
+
+def show_escape_pause_screen(win: "visual.Window", lang: str, trial_index: int, total_trials: int) -> bool:
+    """Reproduit l'ecran de pause Echap (lignes 637-657 de
+    HuxlinLabFBAtraining.m) : efface l'ecran, attend 0.2s (anti-rebond), affiche
+    le message de pause, puis attend une touche quelconque. Retourne True si
+    l'utilisateur a confirme vouloir quitter (Echap a nouveau)."""
+    win.flip()
+    core.wait(ESCAPE_DEBOUNCE_S)
+    txt = visual.TextStim(
+        win,
+        text=t("escape_paused_title", lang) + "\n\n" + t("escape_paused_text", lang, trial=trial_index, total=total_trials),
+        color=TEXT_COLOR_RGB, height=26, wrapWidth=900, units="pix", pos=(0, 0),
+    )
+    event.clearEvents(eventType="keyboard")
+    txt.draw()
+    win.flip()
+    keys = event.waitKeys(keyList=None)
+    return bool(keys) and keys[0] == "escape"
+
+
+def do_scheduled_pause(win: "visual.Window", sounds: Dict[str, object], lang: str,
+                        trial_index: int, total_trials: int,
+                        logger: Optional[logging.Logger] = None) -> bool:
+    """Pause programmee configurable (fonctionnalite nouvelle, absente de
+    MATLAB) : decompte d'une minute maximum affiche a l'ecran, ESPACE reprend
+    immediatement, un signal sonore distinct marque le debut de la pause.
+    Retourne True si l'utilisateur a demande a quitter definitivement."""
+    _play(sounds.get("pause"), logger)
+    pause_clock = core.Clock()
+    pause_text = visual.TextStim(win, text="", color=TEXT_COLOR_RGB, height=28, wrapWidth=900, units="pix", pos=(0, 0))
+    event.clearEvents(eventType="keyboard")
+    while True:
+        remaining = max(0.0, SCHEDULED_PAUSE_DURATION_S - pause_clock.getTime())
+        pause_text.text = t("pause_title", lang) + "\n\n" + t("pause_text", lang, secs=int(math.ceil(remaining)))
+        pause_text.draw()
+        win.flip()
+        keys = event.getKeys(keyList=["space", "escape"])
+        if "escape" in keys:
+            if show_escape_pause_screen(win, lang, trial_index, total_trials):
+                return True
+            pause_clock.reset()
+            event.clearEvents(eventType="keyboard")
+            continue
+        if "space" in keys or remaining <= 0.0:
+            return False
+
+
+def check_movement_timing(movement_duration_s: float, mv_length: int, frame_ms: float,
+                           logger: logging.Logger, trial_index: int) -> bool:
+    """Compare la duree reellement mesuree de la boucle d'affichage du mouvement
+    (chronometree en temps mur autour du for-loop de flips) a la duree nominale
+    attendue (mv_length * frame_ms). Un ecart relatif au-dela de
+    TIMING_ANOMALY_THRESHOLD indique un decrochage de cadence (frame(s) perdue(s)
+    ou ralentie(s) -- ex: changement de source d'alimentation, charge CPU/GPU
+    concurrente). AJOUT PAR RAPPORT A MATLAB (absent de HuxlinLabFBAtraining.m,
+    qui ne mesure jamais le rythme reellement obtenu : Screen('Preference',
+    'SkipSyncTests',1) l.227, et aucun appel a GetFlipInterval/VBLTimestamp
+    n'existe dans ce fichier) -- demande explicitement le 27/08 suite a un
+    signal utilisateur de variation de vitesse des points lors d'un changement
+    de source d'alimentation. Journalise seulement (non bloquant) pour un essai
+    reel ; voir run_performance_check pour l'usage bloquant en debut de seance."""
+    nominal_s = mv_length * frame_ms / 1000.0
+    if nominal_s <= 0:
+        return False
+    relative_error = abs(movement_duration_s - nominal_s) / nominal_s
+    anomaly = relative_error > TIMING_ANOMALY_THRESHOLD
+    if anomaly:
+        logger.warning(
+            "Anomalie de timing a l'essai %s : duree mouvement mesuree=%.4fs attendue=%.4fs ecart=%.1f%%",
+            trial_index, movement_duration_s, nominal_s, 100.0 * relative_error,
+        )
+    return anomaly
+
+
+def get_windows_power_status() -> Optional[int]:
+    """Interroge l'API Windows GetSystemPowerStatus (kernel32) pour connaitre la
+    source d'alimentation actuelle. Retourne la valeur ACLineStatus (0=batterie,
+    1=secteur, 255=inconnu), ou None si l'appel echoue ou si la plateforme n'est
+    pas Windows (ex: tests, autre OS). AJOUT PAR RAPPORT A MATLAB, absent de
+    HuxlinLabFBAtraining.m -- demande explicitement le 27/08 suite a un signal
+    utilisateur de branchement/debranchement secteur en cours de seance sur un
+    laptop gaming bride sur batterie. Reference officielle :
+    learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-system_power_status
+    (struct SYSTEM_POWER_STATUS). Comme dans detect_windows_internal_display
+    ci-dessus, les champs utilisent des types ctypes a largeur FIXE (c_uint8/
+    c_uint32) plutot que ctypes.wintypes, pour la meme raison documentee
+    (ctypes.wintypes.DWORD alias C `unsigned long`, dont la taille depend de la
+    plateforme de DEVELOPPEMENT et pas seulement de la plateforme cible)."""
+    if platform.system() != "Windows":
+        return None
+    try:
+        import ctypes
+
+        class _SystemPowerStatus(ctypes.Structure):
+            _fields_ = [
+                ("ACLineStatus", ctypes.c_uint8),
+                ("BatteryFlag", ctypes.c_uint8),
+                ("BatteryLifePercent", ctypes.c_uint8),
+                ("SystemStatusFlag", ctypes.c_uint8),
+                ("BatteryLifeTime", ctypes.c_uint32),
+                ("BatteryFullLifeTime", ctypes.c_uint32),
+            ]
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.GetSystemPowerStatus.argtypes = [ctypes.POINTER(_SystemPowerStatus)]
+        kernel32.GetSystemPowerStatus.restype = ctypes.c_int32
+
+        status = _SystemPowerStatus()
+        ok = kernel32.GetSystemPowerStatus(ctypes.byref(status))
+        if not ok:
+            return None
+        return int(status.ACLineStatus)
+    except Exception:
+        return None
+
+
+def check_power_source_change(baseline: Optional[int], logger: logging.Logger) -> bool:
+    """Compare la source d'alimentation actuelle a la reference prise au debut
+    de la seance reelle (voir run_session). AJOUT PAR RAPPORT A MATLAB, demande
+    explicitement le 27/08. DEVIATION ASSUMEE (design confirme par
+    l'utilisateur) : simple avertissement journalise (code E11) + note affichee
+    sur l'ecran de fin de seance, PAS de popup bloquant en cours d'essai --
+    interrompre un essai en cours serait plus perturbant pour un patient
+    neurovisuel que le probleme (fluidite degradee) qu'un tel popup
+    signalerait. Retourne True si un changement vient d'etre detecte."""
+    if baseline is None or baseline == 255:
+        return False
+    current = get_windows_power_status()
+    if current is None or current == 255:
+        return False
+    if current != baseline:
+        logger.warning(
+            "[%s] Changement de source d'alimentation detecte en cours de seance (avant=%s apres=%s).",
+            ERR_CODE_POWER_SOURCE, baseline, current,
+        )
+        return True
+    return False
+
+# -----------------------------------------------------------------------------
+# Boucle d'essais -- orchestration complete d'une seance
+# -----------------------------------------------------------------------------
+# Structure alignee ecran-par-ecran sur les lignes 364-668 de
+# HuxlinLabFBAtraining.m : fixation -> precue (si active) -> ISI compensee ->
+# mouvement -> reponse (attente indefinie) -> mise a jour staircase -> essai
+# suivant. Les deux pauses "inventees" du draft precedent (1s fixe avant la
+# precue, 0.5s fixe apres chaque essai) sont absentes de MATLAB et donc absentes
+# ici. Le chronometre de temps de reponse demarre a l'EXTINCTION du stimulus
+# (comme le `tic` MATLAB, ligne 581), pas a son apparition.
+
+def run_session(win: "visual.Window", profile: "ScreenProfile", settings: "SessionSettings",
+                 logger: logging.Logger) -> SessionOutcome:
+    lang = settings.language
+    angle_set = settings.angle_set
+    ppd = profile.px_per_deg
+
+    n_trials_per_staircase, total_trials = compute_actual_trial_counts(settings.n_trials)
+    pause_trial_indices = compute_pause_trial_indices(settings.pause_mode, total_trials)
+    calib = compute_calibration_check(profile, settings)
+
+    n_dots = compute_n_dots(APERTURE_RADIUS_DEG, DOT_DENSITY_PER_DEG2)
+    radius_px = deg2px(APERTURE_RADIUS_DEG, ppd)
+    dot_size_px = max(1.0, math.floor(compute_dot_size_px(ppd)))
+
+    refresh = win.getActualFrameRate(nIdentical=20, nMaxFrames=120, nWarmUpFrames=20)
+    if not refresh or refresh <= 0:
+        refresh = 60.0
+        logger.warning("Frequence de rafraichissement non mesurable, valeur par defaut retenue : 60 Hz.")
+    frame_ms = 1000.0 / refresh
+    mv_length = max(1, int(round(STIMULUS_DURATION_MS / frame_ms)))
+    lifetime_frames = max(1.0, DOT_LIFETIME_MS / frame_ms)  # reste flottant, voir note de fidelite
+    step_px = deg2px(DOT_SPEED_DEG_PER_S / refresh, ppd)
+    logger.info(
+        "Frequence mesuree=%.2f Hz | mv_length=%d frames | lifetime=%.2f frames | ndots=%d | dot_size=%.0f px | "
+        "total_essais=%d (%d/staircase) | pauses programmees apres essais %s",
+        refresh, mv_length, lifetime_frames, n_dots, dot_size_px, total_trials, n_trials_per_staircase,
+        pause_trial_indices,
+    )
+
+    fix_pos_px = (deg2px(settings.fixation_h_deg, ppd), deg2px(settings.fixation_v_deg, ppd))
+    stim_pos_px = (deg2px(settings.stim_h_deg, ppd), deg2px(settings.stim_v_deg, ppd))
+
+    fixation_outer = visual.Circle(
+        win, radius=deg2px(FIX_OUTER_RADIUS_DEG, ppd), fillColor=FIX_OUTER_COLOR_RGB,
+        lineColor=FIX_OUTER_COLOR_RGB, pos=fix_pos_px, units="pix",
+    )
+    fixation_inner = visual.Circle(
+        win, radius=deg2px(FIX_INNER_RADIUS_DEG, ppd), fillColor=FIX_INNER_COLOR_RGB,
+        lineColor=FIX_INNER_COLOR_RGB, pos=fix_pos_px, units="pix",
+    )
+    dots = visual.ElementArrayStim(
+        win, nElements=n_dots, elementTex=None, elementMask="circle",
+        xys=np.zeros((n_dots, 2)), sizes=[dot_size_px] * n_dots, units="pix",
+        colors=[DOT_COLOR_RGB] * n_dots, colorSpace="rgb", sfs=0, fieldPos=stim_pos_px,
+    )
+
+    def draw_fixation() -> None:
+        fixation_outer.draw()
+        fixation_inner.draw()
+
+    def build_precue_lines(base_side: int, angle_dev_deg: float) -> Tuple["visual.Line", "visual.Line"]:
+        """Reconstruit les deux segments de la precue A CHAQUE appel plutot que
+        de reassigner .start/.end sur des objets Line reutilises : certaines
+        versions de PsychoPy ne recalculent pas la geometrie affichee quand ces
+        attributs sont modifies apres la construction, ce qui rendait la precue
+        invisible (segments restes a leur position de creation (0,0)->(0,0))."""
+        (dx1, dy1), (dx2, dy2) = compute_precue_geometry(base_side, angle_dev_deg, profile.width_px)
+        line1 = visual.Line(
+            win, start=fix_pos_px, end=(fix_pos_px[0] + dx1, fix_pos_px[1] + dy1),
+            lineColor=CUE_COLOR_RGB, lineWidth=3, units="pix",
+        )
+        line2 = visual.Line(
+            win, start=fix_pos_px, end=(fix_pos_px[0] + dx2, fix_pos_px[1] + dy2),
+            lineColor=CUE_COLOR_RGB, lineWidth=3, units="pix",
+        )
+        return line1, line2
+
+    sounds = build_session_sounds(logger)
+    stair_idxs = INITIAL_STAIR_IDXS.copy()
+    streak_counts = [0, 0, 0]
+    stair_sequence = build_stair_sequence(n_trials_per_staircase)
+
+    outcome = SessionOutcome(total_trials_planned=total_trials, frame_rate_measured=float(refresh), calibration_check=calib)
+    rt_clock = core.Clock()
+
+    def run_one_trial(base_side: int, tilt_sign: int, angle_dev_deg: float,
+                       display_trial_index: int, display_total_trials: int) -> TrialRunResult:
+        """Sequence complete d'un essai unique : precue (si activee) -> ISI
+        compensee -> son de depart -> mouvement -> extinction -> attente de
+        reponse (avec gestion Echap = pause/reprise). Extrait de la boucle
+        d'essais (auparavant inline) le 27/08 pour etre reutilisee A
+        L'IDENTIQUE par la vraie sequence d'essais ET par run_performance_check
+        (essais d'echauffement) -- garantit que les essais d'echauffement sont
+        visuellement et temporellement indiscernables d'un vrai essai pour le
+        patient, comme demande explicitement ("silencieux")."""
+        td = compute_trial_direction(angle_set, base_side, tilt_sign, angle_dev_deg)
+
+        # --- Precue (si activee) : chevron, visible cue_duration secondes ---
+        if settings.show_precue:
+            cue_line1, cue_line2 = build_precue_lines(base_side, angle_dev_deg)
+            cue_line1.draw()
+            cue_line2.draw()
+            draw_fixation()
+            win.flip()
+            core.wait(CUE_DURATION_S)
+
+        # --- Retrait de la precue, demarrage de l'ISI compensee (l.503-554) ---
+        draw_fixation()
+        win.flip()
+        t_cue_off = core.getTime()
+
+        frames = precompute_trial_frames(n_dots, radius_px, lifetime_frames, td.vx, td.vy, step_px, mv_length)
+
+        elapsed = core.getTime() - t_cue_off
+        remaining = POST_CUE_ISI_S - elapsed
+        if remaining > 0:
+            core.wait(remaining)
+
+        # --- Elevation de priorite OS pendant [son de depart + mouvement], cf.
+        # Priority(MaxPriority(w)) MATLAB l.555-556 (juste avant le son de
+        # depart) / Priority(0) l.582 (juste apres le dernier flip du
+        # mouvement) -- AJOUT PAR RAPPORT AU PYTHON PRECEDENT (core.rush()
+        # absent depuis le tout premier brouillon), demande explicitement le
+        # 27/08 suite a un signal utilisateur de variation de vitesse des
+        # points lors d'un changement de source d'alimentation. Cf.
+        # psychopy.org/api/core.html et discourse.psychopy.org (core.rush est
+        # l'equivalent documente, multi-plateforme, de Priority() : no-op
+        # silencieux la ou l'OS ne supporte pas l'elevation de priorite).
+        core.rush(True)
+        _play(sounds.get("start"), logger)
+        core.wait(POST_START_SOUND_GAP_S)
+
+        # --- Mouvement (frame 1 = position initiale statique, l.510-517) ---
+        win.callOnFlip(event.clearEvents, eventType="keyboard")
+        t_movement_start = core.getTime()
+        for frame_positions in frames:
+            dots.xys = frame_positions
+            dots.draw()
+            draw_fixation()
+            win.flip()
+        movement_duration_s = core.getTime() - t_movement_start
+
+        # --- Extinction du stimulus ; le chrono de RT demarre ICI (l.578-581) ---
+        draw_fixation()
+        win.flip()
+        core.rush(False)
+
+        event.clearEvents(eventType="keyboard")
+        rt_clock.reset()
+
+        timing_anomaly = check_movement_timing(movement_duration_s, mv_length, frame_ms, logger, display_trial_index)
+
+        # --- Attente de reponse, indefinie, avec gestion Echap = pause/reprise ---
+        quit_requested = False
+        key_pressed = ""
+        rt_s = float("nan")
+        trial_paused_s = 0.0
+        while True:
+            keys = event.waitKeys(keyList=[td.correct_key, td.incorrect_key, "escape"], timeStamped=rt_clock)
+            key_pressed, rt_s = keys[0]
+            if key_pressed == "escape":
+                t_pause_start = core.getTime()
+                if show_escape_pause_screen(win, lang, display_trial_index, display_total_trials):
+                    quit_requested = True
+                    break
+                pause_elapsed = core.getTime() - t_pause_start
+                trial_paused_s += pause_elapsed
+                draw_fixation()
+                win.flip()
+                continue
+            break
+
+        if quit_requested:
+            return TrialRunResult(
+                quit_requested=True, key_pressed="", rt_s=float("nan"), correct=False,
+                angle_deg=float(td.angle_deg), correct_key=td.correct_key,
+                trial_paused_s=trial_paused_s, movement_duration_s=movement_duration_s,
+                timing_anomaly=timing_anomaly,
+            )
+
+        # Retranche le temps de pause Echap (voir DEVIATION ASSUMEE plus bas) : rt_s tel que
+        # renvoye par event.waitKeys(timeStamped=rt_clock) inclut sinon integralement la duree
+        # de l'ecran de pause, puisque rt_clock n'est jamais mis en pause lui-meme.
+        rt_s = max(0.0, rt_s - trial_paused_s)
+        correct = key_pressed == td.correct_key
+        _play(sounds.get("correct") if correct else sounds.get("incorrect"), logger)
+
+        return TrialRunResult(
+            quit_requested=False, key_pressed=key_pressed, rt_s=float(rt_s), correct=correct,
+            angle_deg=float(td.angle_deg), correct_key=td.correct_key,
+            trial_paused_s=trial_paused_s, movement_duration_s=movement_duration_s,
+            timing_anomaly=timing_anomaly,
+        )
+
+    def run_performance_check() -> Tuple[str, str]:
+        """Phase de verification initiale (NOUVEAU, absent de MATLAB) : fait
+        tourner PERF_CHECK_N_TRIALS essais visuellement et temporellement
+        identiques a de vrais essais (meme stimulus, meme sequence d'ecrans,
+        reponse du patient attendue et traitee normalement, meme angle facile
+        pour ne pas tester le patient) via run_one_trial, MAIS dont les
+        resultats ne sont ni comptabilises dans les staircases ni enregistres
+        dans le CSV -- ils servent uniquement a mesurer le rythme d'affichage
+        reellement obtenu sur cette machine, a ce moment precis, avant de
+        lancer la vraie sequence. AJOUT PAR RAPPORT A MATLAB, demande
+        explicitement le 27/08 en reponse a un signal utilisateur de variation
+        de vitesse des points lors d'un changement de source d'alimentation sur
+        un laptop gaming bride sur batterie. Design confirme par l'utilisateur :
+        phase silencieuse (indiscernable d'un vrai essai pour le patient) et
+        BLOQUANTE en cas d'anomalie (la seance ne demarre pas). Retourne
+        (statut, detail) avec statut in {'ok', 'quit', 'anomaly'}."""
+        n_anomalies = 0
+        for _ in range(PERF_CHECK_N_TRIALS):
+            draw_fixation()
+            win.flip()
+            base_side = int(np.random.randint(1, 3))
+            tilt_sign = int(np.random.choice([-1, 1]))
+            result = run_one_trial(base_side, tilt_sign, PERF_CHECK_ANGLE_DEV_DEG, 1, total_trials)
+            if result.quit_requested:
+                return "quit", ""
+            if result.timing_anomaly:
+                n_anomalies += 1
+            draw_fixation()
+            win.flip()
+        if n_anomalies > 0:
+            detail = f"{n_anomalies}/{PERF_CHECK_N_TRIALS} essai(s) d'echauffement en anomalie de timing"
+            logger.error("[%s] Verification initiale de performance echouee : %s", ERR_CODE_PERF_CHECK, detail)
+            return "anomaly", detail
+        logger.info("Verification initiale de performance : OK (%d essais, aucune anomalie).", PERF_CHECK_N_TRIALS)
+        return "ok", ""
+
+    draw_fixation()
+    win.flip()
+
+    perf_status, perf_detail = run_performance_check()
+    if perf_status == "quit":
+        outcome.aborted = True
+        outcome.final_stair_idxs = stair_idxs
+        logger.info("Arret demande par l'utilisateur (Echap) pendant la verification initiale de performance.")
+        return outcome
+    if perf_status == "anomaly":
+        outcome.perf_check_failed = True
+        outcome.error = f"[{ERR_CODE_PERF_CHECK}] {perf_detail}"
+        outcome.final_stair_idxs = stair_idxs
+        return outcome
+
+    # session_clock demarre ICI, APRES la verification initiale : sa duree n'est
+    # jamais incluse dans outcome.total_time_s (coherent avec le fait que ces
+    # essais ne sont pas des essais reels). power_source_baseline est capture au
+    # meme moment, comme reference pour check_power_source_change pendant la
+    # vraie seance -- AJOUTS PAR RAPPORT A MATLAB, voir plus haut.
+    session_clock = core.Clock()
+    power_source_baseline = get_windows_power_status()
+    # DEVIATION ASSUMEE (demandee explicitement le 27/08, apres confirmation que MATLAB, lui,
+    # NE bloque le chrono ni pour une pause Echap ni pour une pause programmee -- le temps de
+    # pause y reste inclus a la fois dans le temps de reaction et dans totalTime). Ici, le temps
+    # passe en pause (Echap pendant l'attente de reponse, OU pause programmee entre deux essais)
+    # est retranche a la fois du temps de reaction (rt_s, par essai) et de la duree totale de
+    # seance (outcome.total_time_s). total_paused_s cumule les deux types de pause sur toute la
+    # seance ; voir son usage plus bas.
+    total_paused_s = 0.0
+
+    draw_fixation()
+    win.flip()
+
+    try:
+        for trial_index, which_stair in enumerate(stair_sequence, start=1):
+            # --- Ecran de fixation seule (haut de boucle MATLAB, l.370-372) ---
+            # NOTE : le compteur d'essais a l'ecran (present dans MATLAB) a ete
+            # retire de l'affichage a la demande de l'utilisateur ; le numero
+            # d'essai reste enregistre dans les logs et le CSV de sortie.
+            draw_fixation()
+            win.flip()
+
+            # --- Selection direction/orientation/difficulte (instantane) ---
+            maybe_advance_staircase(stair_idxs, streak_counts, which_stair, len(ANGLE_RANGE_DEG))
+            angle_dev_deg = ANGLE_RANGE_DEG[stair_idxs[which_stair - 1]]
+            base_side = int(np.random.randint(1, 3))
+            tilt_sign = int(np.random.choice([-1, 1]))
+
+            result = run_one_trial(base_side, tilt_sign, angle_dev_deg, trial_index, total_trials)
+
+            if result.quit_requested:
+                outcome.aborted = True
+                logger.info("Arret demande par l'utilisateur (Echap) a l'essai %d/%d.", trial_index, total_trials)
+                break
+
+            total_paused_s += result.trial_paused_s
+            record_staircase_response(stair_idxs, streak_counts, which_stair, result.correct, len(ANGLE_RANGE_DEG))
+
+            if not outcome.power_source_changed:
+                outcome.power_source_changed = check_power_source_change(power_source_baseline, logger)
+
+            outcome.trials.append(TrialRecord(
+                trial=trial_index, staircase_id=which_stair, angle_dev_deg=float(angle_dev_deg),
+                base_side=base_side, tilt_sign=tilt_sign, angle_deg=result.angle_deg,
+                correct_key=result.correct_key, key_pressed=result.key_pressed,
+                is_correct=int(result.correct), rt_s=result.rt_s,
+                timing_anomaly=int(result.timing_anomaly),
+            ))
+            logger.debug(
+                "Essai %d/%d staircase=%d dev=%.2f base_side=%d tilt=%+d correct_key=%s touche=%s rt=%.3f "
+                "correct=%d anomalie_timing=%d",
+                trial_index, total_trials, which_stair, angle_dev_deg, base_side, tilt_sign,
+                result.correct_key, result.key_pressed, result.rt_s, int(result.correct),
+                int(result.timing_anomaly),
+            )
+
+            draw_fixation()
+            win.flip()
+
+            if trial_index in pause_trial_indices:
+                logger.info("Pause programmee apres l'essai %d/%d.", trial_index, total_trials)
+                t_pause_start = core.getTime()
+                if do_scheduled_pause(win, sounds, lang, trial_index, total_trials, logger):
+                    outcome.aborted = True
+                    logger.info("Arret demande par l'utilisateur (Echap pendant une pause programmee).")
+                    break
+                # Voir DEVIATION ASSUMEE plus haut : la duree de la pause programmee (jusqu'a
+                # SCHEDULED_PAUSE_DURATION_S, plus toute pause Echap imbriquee a l'interieur) est
+                # elle aussi retranchee de la duree totale de seance.
+                total_paused_s += core.getTime() - t_pause_start
+                draw_fixation()
+                win.flip()
+
+    except Exception as exc:  # pragma: no cover - filet de securite, voir log_uncaught_exception
+        outcome.error = repr(exc)
+        logger.error("Exception pendant la seance : %s", exc)
+        log_uncaught_exception(logger, exc)
+
+    outcome.total_time_s = max(0.0, session_clock.getTime() - total_paused_s)
+    outcome.final_stair_idxs = stair_idxs
+    return outcome
+
+# -----------------------------------------------------------------------------
+# Preference de langue et de dernier patient, au niveau application (choisies
+# au 1er lancement, memorisees)
+# -----------------------------------------------------------------------------
+
+def load_app_language() -> Optional[str]:
+    lang = _load_json(APP_PREFS_FILE).get("language")
+    return lang if lang in TR else None
+
+
+def save_app_language(lang: str) -> None:
+    prefs = _load_json(APP_PREFS_FILE)
+    prefs["language"] = lang
+    _save_json(APP_PREFS_FILE, prefs)
+
+
+def _load_last_subject_id() -> str:
+    sid = _load_json(APP_PREFS_FILE).get("last_subject_id")
+    return sid if sid else DEFAULT_SUBJECT_ID
+
+
+def _save_last_subject_id(subject_id: str, logger: Optional[logging.Logger] = None) -> None:
+    prefs = _load_json(APP_PREFS_FILE)
+    prefs["last_subject_id"] = subject_id
+    _save_json(APP_PREFS_FILE, prefs, logger)
+
+
+_LANG_DISPLAY_NAMES = {"fr": "Francais", "en": "English"}
+_LANG_DISPLAY_TO_CODE = {v: k for k, v in _LANG_DISPLAY_NAMES.items()}
+
+
+# -----------------------------------------------------------------------------
+# Assistant de configuration -- une seule fenetre de saisie par lancement
+# -----------------------------------------------------------------------------
+# Design (revise suite aux retours d'usage reel) : au lieu d'enchainer 5 ecrans
+# a chaque lancement, on distingue deux cas :
+#  - Reglages deja memorises pour ce patient -> UNE fenetre courte recapitule
+#    ces reglages (texte, non modifiable) avec une case a cocher "Modifier ces
+#    reglages avant de commencer" (decochee par defaut). Si elle reste
+#    decochee, on relance directement avec ces reglages (apres une revalidation
+#    materielle silencieuse). Cela evite de re-poser 13 questions a chaque
+#    seance d'un meme patient.
+#  - Sinon (premiere fois, ou case cochee) -> UNE fenetre complete regroupant
+#    tous les champs (ecran, position, parametres de seance). Toutes les
+#    erreurs de saisie ou de garde-fou materiel rouvrent cette MEME fenetre
+#    (jamais une cascade d'ecrans differents).
+# Tout est construit avec `gui.Dlg` (lecture via `.data`, dans l'ordre exact
+# d'ajout des champs -- chaque index est commente ci-dessous pour eviter toute
+# erreur de decalage).
+
+def _ask_language_if_unknown() -> Optional[str]:
+    lang = load_app_language()
+    if lang is not None:
+        return lang
+    dlg = gui.Dlg(title="Langue / Language")
+    dlg.addField("Langue / Language", choices=[_LANG_DISPLAY_NAMES["fr"], _LANG_DISPLAY_NAMES["en"]])  # 0
+    dlg.show()
+    if not dlg.OK:
+        return None
+    try:
+        choice = str(dlg.data[0])
+    except IndexError:
+        choice = _LANG_DISPLAY_NAMES["fr"]
+    lang = _LANG_DISPLAY_TO_CODE.get(choice, "fr")
+    save_app_language(lang)
+    return lang
+
+
+def _describe_screen(s: dict, lang: str) -> str:
+    tag = ("principal" if s["is_primary"] else "secondaire") if lang == "fr" else ("primary" if s["is_primary"] else "secondary")
+    return f'{s["index"]}: {s["width_px"]}x{s["height_px"]} ({tag})'
+
+
+MESSAGE_BOX_MAX_WIDTH_PX = 420  # voir _wrap_label
+
+
+def _wrap_label(label) -> None:
+    """addText() renvoie en realite le QLabel Qt sous-jacent (verifie dans le
+    code source de PsychoPy : psychopy/gui/qtgui.py, Dlg.addText retourne
+    textLabel). Par defaut ce QLabel n'active pas le retour a la ligne, donc un
+    message un peu long s'affichait sur une seule ligne tres large, forcant
+    toute la fenetre a s'etirer demesurement (signale par l'utilisateur pour
+    les popups d'erreur ecran). On force le retour a la ligne et une largeur
+    maximale raisonnable. Best-effort : si l'objet renvoye ne supporte pas ces
+    methodes Qt (version de PsychoPy differente), on ignore silencieusement --
+    c'est un defaut purement cosmetique, pas une raison de faire planter la
+    seance."""
+    try:
+        label.setWordWrap(True)
+        label.setMaximumWidth(MESSAGE_BOX_MAX_WIDTH_PX)
+    except Exception:
+        pass
+
+
+def _show_info_dialog(title: str, message: str) -> None:
+    dlg = gui.Dlg(title=title)
+    _wrap_label(dlg.addText(message))
+    dlg.show()
+
+
+def _ask_yes_no(title: str, message: str, lang: str) -> bool:
+    """Utilise gui.Dlg (pas DlgFromDict) pour bien separer le bloc de texte,
+    potentiellement long et multi-lignes, de la question elle-meme."""
+    dlg = gui.Dlg(title=title)
+    _wrap_label(dlg.addText(message))
+    dlg.addField(">>>", choices=[t("btn_no", lang), t("btn_yes", lang)])  # 0
+    dlg.show()
+    if not dlg.OK:
+        return False
+    try:
+        return str(dlg.data[0]) == t("btn_yes", lang)
+    except IndexError:
+        return False
+
+
+def _blank_settings(subject_id: str, lang: str) -> "SessionSettings":
+    return SessionSettings(subject_id=subject_id, language=lang)
+
+
+def _format_settings_summary(s: "SessionSettings", lang: str) -> str:
+    _, total = compute_actual_trial_counts(s.n_trials)
+    axis_label = t("axis_vertical", lang) if s.axis_mode == "vertical" else t("axis_horizontal", lang)
+    pause_label = t(["pause_0", "pause_1", "pause_2"][s.pause_mode], lang)
+    precue_label = t("yes", lang) if s.show_precue else t("no", lang)
+    return "\n".join([
+        f'{t("field_subject_id", lang)}: {s.subject_id}',
+        f'{t("field_screen_choice", lang)}: #{s.screen_index} - {s.screen_diagonal_in:.1f}" / '
+        f'{s.screen_width_cm:.1f}cm / {s.viewing_distance_cm:.1f}cm',
+        f'{t("field_axis", lang)}: {axis_label}',
+        f'{t("field_fix_h", lang)}: {s.fixation_h_deg:.2f}   {t("field_fix_v", lang)}: {s.fixation_v_deg:.2f}',
+        f'{t("field_stim_h", lang)}: {s.stim_h_deg:.2f}   {t("field_stim_v", lang)}: {s.stim_v_deg:.2f}',
+        f'{t("field_n_trials", lang)}: {total}',
+        f'{t("field_precue", lang)}: {precue_label}',
+        f'{t("field_pause_mode", lang)}: {pause_label}',
+    ])
+
+
+def _ask_recall_or_edit(lang: str, prev: "SessionSettings") -> Optional[Tuple[str, bool]]:
+    """Fenetre courte, affichee uniquement quand des reglages memorises
+    existent deja pour le dernier identifiant utilise. Retourne (identifiant
+    saisi, veut_modifier), ou None si l'utilisateur annule."""
+    dlg = gui.Dlg(title=t("recall_dlg_title", lang))
+    dlg.addText(t("recall_intro", lang))
+    dlg.addField(t("field_subject_id", lang), prev.subject_id)  # 0
+    dlg.addText(_format_settings_summary(prev, lang))
+    dlg.addField(t("field_modify", lang), False)  # 1
+    dlg.show()
+    if not dlg.OK:
+        return None
+    try:
+        subject_id = str(dlg.data[0]).strip() or DEFAULT_SUBJECT_ID
+        want_modify = bool(dlg.data[1])
+    except IndexError:
+        return prev.subject_id, True
+    return subject_id, want_modify
+
+
+def _ask_full_settings(lang: str, base: "SessionSettings",
+                        force_measure: bool = False) -> Optional[Tuple["SessionSettings", "ScreenProfile"]]:
+    """L'unique fenetre complete de configuration, organisee en sections
+    (Consignes / Utilisateur / Ecran / Exercice / Stimulus) pour rester lisible
+    malgre le nombre de champs. Toute erreur de saisie ou de garde-fou materiel
+    rouvre cette meme fenetre, prefillee avec la derniere saisie, plutot que de
+    renvoyer vers un autre ecran.
+
+    AJOUT PAR RAPPORT AU PYTHON PRECEDENT (round 4, 27/08, demande explicitement) :
+    les 13 champs sont desormais tous marques obligatoires (astérisque + legende,
+    voir req()/field_required_note) et la diagonale/largeur physique de l'ecran ne
+    sont plus jamais pre-remplies avec une valeur non mesuree -- ni le placeholder
+    "recommande" (RECOMMENDED_DIAGONAL_IN/SCREEN_WIDTH_CM_DEFAULT), ni l'ancienne
+    estimation automatique a partir de la diagonale seule (voir
+    estimate_width_cm_from_diagonal, desormais un simple filet de securite pour
+    d'anciens reglages sauvegardes, plus une fonctionnalite offerte au patient).
+    force_measure=True (uniquement pour un patient sans aucun historique reel,
+    voir _ask_full_settings_confirmed) blanchit ces deux champs au tout premier
+    affichage seulement -- un nouvel essai apres une erreur sur CETTE soumission
+    re-prefille avec ce que le patient vient de taper, jamais une seconde fois a
+    vide. Un patient avec un historique reel (force_measure=False) voit toujours sa
+    derniere mesure reelle, comme avant."""
+
+    def req(label: str) -> str:
+        return f"{label} *"
+
+    first_pass = True
+    while True:
+        screens = detect_screens()
+        screen_labels = [_describe_screen(s, lang) for s in screens]
+        default_screen_idx = min(max(base.screen_index, 0), len(screen_labels) - 1)
+        ordered_screens = [screen_labels[default_screen_idx]] + [l for l in screen_labels if l != screen_labels[default_screen_idx]]
+
+        axis_key = "axis_vertical" if base.axis_mode == "vertical" else "axis_horizontal"
+        other_axis_key = "axis_horizontal" if base.axis_mode == "vertical" else "axis_vertical"
+        ordered_axis = [t(axis_key, lang), t(other_axis_key, lang)]
+
+        pause_keys = ["pause_0", "pause_1", "pause_2"]
+        ordered_pause = [t(pause_keys[base.pause_mode], lang)] + [t(k, lang) for k in pause_keys if k != pause_keys[base.pause_mode]]
+
+        # Ne blanchir qu'au tout premier affichage ET seulement si ce patient n'a
+        # aucune mesure reelle connue -- voir docstring ci-dessus.
+        blank_measurements = force_measure and first_pass
+        diagonal_default = "" if blank_measurements else base.screen_diagonal_in
+        width_default = "" if blank_measurements else base.screen_width_cm
+
+        dlg = gui.Dlg(title=t("setup_dlg_title", lang))
+
+        dlg.addText(t("section_consignes", lang))
+        dlg.addText(t("consignes_text", lang))
+        dlg.addText(t("field_required_note", lang))
+
+        dlg.addText(t("section_user", lang))
+        dlg.addField(req(t("field_subject_id", lang)), base.subject_id)                # 0
+
+        dlg.addText(t("section_screen", lang))
+        dlg.addField(req(t("field_screen_choice", lang)), choices=ordered_screens)     # 1
+        dlg.addField(req(t("field_diagonal_in", lang)), diagonal_default)              # 2
+        dlg.addField(req(t("field_width_cm", lang)), width_default)                    # 3
+        dlg.addField(req(t("field_distance_cm", lang)), base.viewing_distance_cm)      # 4
+
+        dlg.addText(t("section_exercise", lang))
+        dlg.addField(req(t("field_fix_h", lang)), base.fixation_h_deg)                 # 5
+        dlg.addField(req(t("field_fix_v", lang)), base.fixation_v_deg)                 # 6
+        dlg.addField(req(t("field_n_trials", lang)), base.n_trials)                    # 7
+        dlg.addField(req(t("field_pause_mode", lang)), choices=ordered_pause)          # 8
+
+        dlg.addText(t("section_stimulus", lang))
+        dlg.addField(req(t("field_stim_h", lang)), base.stim_h_deg)                    # 9
+        dlg.addField(req(t("field_stim_v", lang)), base.stim_v_deg)                    # 10
+        dlg.addField(req(t("field_axis", lang)), choices=ordered_axis)                 # 11
+        dlg.addField(req(t("field_precue", lang)), base.show_precue)                   # 12
+        dlg.show()
+        first_pass = False
+        if not dlg.OK:
+            return None
+
+        try:
+            d = dlg.data
+            subject_id = str(d[0]).strip()
+            screen_index = int(str(d[1]).split(":")[0].strip())
+            diagonal_in = float(d[2])
+            width_cm = float(d[3])
+            distance_cm = float(d[4])
+            fix_h, fix_v = float(d[5]), float(d[6])
+            n_trials = max(N_STAIRCASES, int(d[7]))
+            pause_mode = {t("pause_0", lang): 0, t("pause_1", lang): 1, t("pause_2", lang): 2}.get(str(d[8]), 0)
+            stim_h, stim_v = float(d[9]), float(d[10])
+            axis_mode = "vertical" if str(d[11]) == t("axis_vertical", lang) else "horizontal"
+            show_precue = bool(d[12])
+            # CORRECTIF (round 4, 27/08) : subject_id retombait silencieusement sur
+            # DEFAULT_SUBJECT_ID s'il etait laisse vide -- incoherent avec "tous les
+            # champs sont obligatoires". width_cm<=0 est desormais rejete ici aussi
+            # (auparavant seul un ValueError de float() sur un champ vide l'aurait
+            # attrape ; une valeur explicitement saisie a 0 ou negative passait).
+            if not subject_id or diagonal_in <= 0 or width_cm <= 0 or distance_cm <= 0:
+                raise ValueError("valeurs obligatoires manquantes ou invalides")
+        except (ValueError, IndexError):
+            _show_info_dialog(f'{t("err_generic_title", lang)} [{ERR_CODE_INVALID_INPUT}]', t("err_invalid_inputs", lang))
+            continue
+
+        candidate = SessionSettings(
+            subject_id=subject_id, language=lang, screen_index=screen_index,
+            screen_diagonal_in=diagonal_in, screen_width_cm=width_cm, viewing_distance_cm=distance_cm,
+            axis_mode=axis_mode, fixation_h_deg=fix_h, fixation_v_deg=fix_v,
+            stim_h_deg=stim_h, stim_v_deg=stim_v, n_trials=n_trials,
+            show_precue=show_precue, pause_mode=pause_mode,
+        )
+        base = candidate  # pour reprefiller la fenetre si une des verifications suivantes echoue
+
+        chosen = next((s for s in screens if s["index"] == screen_index), screens[0])
+        if not validate_resolution(chosen["width_px"], chosen["height_px"]):
+            _show_info_dialog(f'{t("err_resolution_title", lang)} [{ERR_CODE_RESOLUTION}]', t("err_resolution_msg", lang,
+                res=f'{chosen["width_px"]}x{chosen["height_px"]}', minres=f"{MIN_RESOLUTION_PX[0]}x{MIN_RESOLUTION_PX[1]}"))
+            continue
+
+        diag_class = classify_diagonal(diagonal_in)
+        if diag_class == "reject":
+            _show_info_dialog(f'{t("err_diagonal_title", lang)} [{ERR_CODE_DIAGONAL_MIN}]', t("err_diagonal_msg", lang,
+                diag=diagonal_in, mindiag=MIN_DIAGONAL_IN, recdiag=RECOMMENDED_DIAGONAL_IN))
+            continue
+        if diag_class == "warn":
+            if not _ask_yes_no(f'{t("warn_diagonal_title", lang)} [{ERR_CODE_DIAGONAL_WARN}]', t("warn_diagonal_msg", lang,
+                    diag=diagonal_in, mindiag=MIN_DIAGONAL_IN, recdiag=RECOMMENDED_DIAGONAL_IN), lang):
+                continue
+
+        # Garde-fou anti-triche (1/2) : heuristique souple de plausibilite DPI.
+        # Avertit (n'empeche pas) sur une combinaison resolution/diagonale typique
+        # d'une dalle d'ordinateur portable declaree avec une diagonale exageree.
+        dpi = estimate_dpi(chosen["width_px"], chosen["height_px"], diagonal_in)
+        if not is_dpi_plausible(dpi):
+            if not _ask_yes_no(f'{t("warn_dpi_title", lang)} [{ERR_CODE_DPI}]', t("warn_dpi_msg", lang,
+                    diag=diagonal_in, res=f'{chosen["width_px"]}x{chosen["height_px"]}', dpi=dpi), lang):
+                continue
+
+        # Garde-fou anti-triche (2/2) : detection technique reelle (Windows
+        # uniquement pour l'instant -- voir detect_windows_internal_display).
+        # Avertit UNIQUEMENT (jamais de blocage dur) : ce code n'a pas pu etre
+        # teste sur une vraie machine Windows pendant le developpement, donc en
+        # cas d'erreur de detection la consequence doit rester reversible.
+        internal_detected = detect_windows_internal_display()
+        if internal_detected is True:
+            if not _ask_yes_no(f'{t("warn_internal_display_title", lang)} [{ERR_CODE_INTERNAL_DISPLAY}]',
+                                t("warn_internal_display_msg", lang), lang):
+                continue
+
+        profile = build_screen_profile(screen_index, chosen["width_px"], chosen["height_px"], diagonal_in, width_cm, distance_cm)
+        if profile.dot_size_px < MIN_DOT_SIZE_PX:
+            _show_info_dialog(f'{t("err_dotsize_title", lang)} [{ERR_CODE_DOT_SIZE}]', t("err_dotsize_msg", lang,
+                px=f"{profile.dot_size_px:.1f}", minpx=MIN_DOT_SIZE_PX))
+            continue
+
+        fit = check_stimulus_fits(profile.px_per_deg, profile.width_px, profile.height_px, stim_h, stim_v)
+        if not fit["ok"]:
+            fov = 2.0 * min(fit["half_w_deg"], fit["half_h_deg"])
+            ecc = max(fit["needed_h_deg"], fit["needed_v_deg"])
+            _show_info_dialog(f'{t("err_fit_title", lang)} [{ERR_CODE_STIM_FIT}]',
+                               t("err_fit_msg", lang, ecc=ecc, ap=APERTURE_RADIUS_DEG, fov=fov))
+            continue
+
+        return candidate, profile
+
+
+def _confirm_settings_change(lang: str, diffs: List[Tuple[str, str, str]]) -> bool:
+    """Popup affichee uniquement quand les reglages valides different de la
+    derniere seance memorisee pour cet utilisateur (voir diff_settings).
+    Repondre 'Non' renvoie vers la fenetre de configuration, prefillee, pour
+    corriger avant de relancer."""
+    lines = "\n".join(
+        f'- {t(_FIELD_LABEL_KEY.get(key, key), lang)} : {old} -> {new}'
+        for key, old, new in diffs
+    )
+    message = "\n\n".join([t("confirm_changed_diff", lang), lines, t("confirm_proceed", lang)])
+    return _ask_yes_no(t("confirm_changed_title", lang), message, lang)
+
+
+def _ask_full_settings_confirmed(lang: str, base: "SessionSettings",
+                                  prev: Optional["SessionSettings"]) -> Optional[Tuple["SessionSettings", "ScreenProfile"]]:
+    """Enchaine _ask_full_settings et, uniquement si les reglages valides
+    different de la derniere seance memorisee, la popup de confirmation --
+    en reprefillant et rouvrant la meme fenetre tant que l'ecart n'est ni
+    confirme, ni corrige.
+
+    AJOUT (round 4, 27/08) : force_measure=True uniquement quand prev est None,
+    c'est-a-dire un patient sans AUCUN historique reel -- voir _ask_full_settings.
+    Sans consequence sur la boucle ci-dessous : si prev est None, diff_settings
+    renvoie toujours [] (rien a comparer), donc cette boucle ne fait jamais plus
+    d'un tour dans ce cas precis ; force_measure ne peut donc jamais blanchir les
+    champs une seconde fois."""
+    force_measure = prev is None
+    while True:
+        edited = _ask_full_settings(lang, base, force_measure)
+        if edited is None:
+            return None
+        base, profile = edited
+        diffs = diff_settings(prev, base)
+        if not diffs or _confirm_settings_change(lang, diffs):
+            return base, profile
+
+
+def run_setup_wizard(logger: logging.Logger) -> Optional[Tuple["SessionSettings", "ScreenProfile"]]:
+    lang = _ask_language_if_unknown()
+    if lang is None:
+        return None
+
+    last_id = _load_last_subject_id()
+    prev = load_last_settings(last_id)
+
+    if prev is not None:
+        recall = _ask_recall_or_edit(lang, prev)
+        if recall is None:
+            return None
+        subject_id, want_modify = recall
+        if subject_id != prev.subject_id:
+            # Identifiant different de celui affiche dans le recapitulatif : on
+            # considere qu'il s'agit d'un autre utilisateur. On reassigne `prev`
+            # a SES reglages memorises s'ils existent (sinon None), pour que la
+            # comparaison d'ecarts/popup de confirmation plus bas porte sur le
+            # bon historique -- pas sur celui de l'identifiant precedent, ce qui
+            # produirait un "vous avez modifie..." absurde pour un nouvel
+            # utilisateur sans aucun historique.
+            prev = load_last_settings(subject_id)
+            base = prev if prev is not None else _blank_settings(subject_id, lang)
+            want_modify = True
+        else:
+            base = prev
+    else:
+        subject_id = last_id
+        base = _blank_settings(subject_id, lang)
+        want_modify = True
+
+    base.subject_id = subject_id
+    base.language = lang
+
+    profile = None
+    if want_modify:
+        edited = _ask_full_settings_confirmed(lang, base, prev)
+        if edited is None:
+            return None
+        base, profile = edited
+    else:
+        # Reglages memorises acceptes tels quels : on revalide silencieusement
+        # le materiel (l'ecran ou la distance ont pu changer depuis) et on ne
+        # rouvre une fenetre que si cette revalidation echoue.
+        screens = detect_screens()
+        chosen = next((s for s in screens if s["index"] == base.screen_index), screens[0])
+        if validate_resolution(chosen["width_px"], chosen["height_px"]) and classify_diagonal(base.screen_diagonal_in) != "reject":
+            candidate_profile = build_screen_profile(
+                base.screen_index, chosen["width_px"], chosen["height_px"],
+                base.screen_diagonal_in, base.screen_width_cm, base.viewing_distance_cm,
+            )
+            fit = check_stimulus_fits(candidate_profile.px_per_deg, candidate_profile.width_px,
+                                       candidate_profile.height_px, base.stim_h_deg, base.stim_v_deg)
+            if candidate_profile.dot_size_px >= MIN_DOT_SIZE_PX and fit["ok"]:
+                profile = candidate_profile
+        if profile is None:
+            logger.info("Reglages memorises non valides sur le materiel actuel -- reouverture de la configuration.")
+            edited = _ask_full_settings_confirmed(lang, base, prev)
+            if edited is None:
+                return None
+            base, profile = edited
+
+    diffs = diff_settings(prev, base)
+    if diffs:
+        logger.info("Ecarts par rapport a la derniere seance de cet utilisateur : %s", diffs)
+
+    # Verification physique de calibration : on ne la redemande QUE si le
+    # profil ecran reellement resolu (resolution detectee + diagonale/largeur/
+    # distance saisies) differe de celui pour lequel elle a deja ete confirmee
+    # -- voir le commentaire sur SessionSettings.calibration_verified.
+    if (profile is not None and prev is not None and prev.calibration_verified
+            and profile.width_px == prev.calib_verified_width_px
+            and profile.height_px == prev.calib_verified_height_px
+            and profile.diagonal_in == prev.calib_verified_diagonal_in
+            and profile.width_cm == prev.calib_verified_width_cm
+            and profile.viewing_distance_cm == prev.calib_verified_distance_cm):
+        base.calibration_verified = True
+        base.calib_verified_width_px = prev.calib_verified_width_px
+        base.calib_verified_height_px = prev.calib_verified_height_px
+        base.calib_verified_diagonal_in = prev.calib_verified_diagonal_in
+        base.calib_verified_width_cm = prev.calib_verified_width_cm
+        base.calib_verified_distance_cm = prev.calib_verified_distance_cm
+        logger.info("Profil ecran identique a celui deja verifie au metre -- verification physique non redemandee.")
+    else:
+        base.calibration_verified = False
+        if prev is not None and prev.calibration_verified:
+            logger.info("Profil ecran different de celui deja verifie au metre -- nouvelle verification physique requise.")
+
+    save_settings(base, logger)
+    _save_last_subject_id(base.subject_id, logger)
+    return base, profile
+
+# -----------------------------------------------------------------------------
+# Ecriture des resultats -- CSV par essai + JSON de resume enrichi
+# -----------------------------------------------------------------------------
+
+def compute_rt_statistics(trials: List["TrialRecord"]) -> dict:
+    """AJOUT PAR RAPPORT AU PYTHON PRECEDENT (27/08, round 3) : statistiques
+    agregees de temps de reponse, absentes du JSON de sortie jusqu'ici --
+    recommande par l'audit V4 (S7.3, S13.3). Purement descriptif (n'influence
+    ni le staircase ni le deroulement de la seance ; ajoute uniquement au
+    resume pour le clinicien/l'aidant). Calcule sur outcome.trials, qui
+    n'inclut jamais un essai interrompu par Echap (voir run_session : le
+    "break" sur result.quit_requested a lieu AVANT l'ajout du TrialRecord),
+    donc jamais de rt_s NaN ici. Retourne la moyenne/mediane globales, plus le
+    detail par staircase (moyenne/mediane/ecart-type -- ce dernier necessite
+    au moins 2 essais sur cette staircase, sinon 0.0)."""
+    global_rts = [r.rt_s for r in trials]
+    par_staircase: Dict[str, dict] = {}
+    for stair_id in sorted({r.staircase_id for r in trials}):
+        stair_rts = [r.rt_s for r in trials if r.staircase_id == stair_id]
+        par_staircase[str(stair_id)] = {
+            "n": len(stair_rts),
+            "moyenne_s": statistics.mean(stair_rts) if stair_rts else None,
+            "mediane_s": statistics.median(stair_rts) if stair_rts else None,
+            "ecart_type_s": statistics.stdev(stair_rts) if len(stair_rts) >= 2 else 0.0,
+        }
+    return {
+        "global": {
+            "n": len(global_rts),
+            "moyenne_s": statistics.mean(global_rts) if global_rts else None,
+            "mediane_s": statistics.median(global_rts) if global_rts else None,
+        },
+        "par_staircase": par_staircase,
+    }
+
+
+def _write_session_outputs_to_dir(data_dir: str, settings: "SessionSettings", profile: "ScreenProfile",
+                                   outcome: SessionOutcome, session_num: int,
+                                   timestamp: _dt.datetime) -> Tuple[str, str]:
+    """Ecrit effectivement le CSV essai-par-essai et le resume JSON dans
+    data_dir. Peut lever une exception (OSError typiquement : disque plein,
+    droits d'acces refuses, chemin invalide) -- voir write_session_outputs pour
+    la gestion de cet echec (bascule vers un repertoire de secours)."""
+    os.makedirs(data_dir, exist_ok=True)
+    basename = build_output_basename(settings.subject_id, session_num, timestamp)
+    csv_path = os.path.join(data_dir, basename + "_essais.csv")
+    json_path = os.path.join(data_dir, basename + "_resume.json")
+
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "essai", "staircase_id", "angle_deviation_deg", "cote_base", "signe_inclinaison",
+            "angle_absolu_deg", "touche_correcte", "touche_pressee", "reponse_correcte", "temps_reponse_s",
+            "anomalie_timing",
+        ])
+        for r in outcome.trials:
+            writer.writerow([
+                r.trial, r.staircase_id, r.angle_dev_deg, r.base_side, r.tilt_sign,
+                r.angle_deg, r.correct_key, r.key_pressed, r.is_correct, r.rt_s, r.timing_anomaly,
+            ])
+
+    summary = {
+        "logiciel": SOFTWARE_NAME,
+        "version_logiciel": SOFTWARE_VERSION,
+        "horodatage": timestamp.isoformat(timespec="seconds"),
+        "numero_seance": session_num,
+        "sujet": settings.subject_id,
+        "langue": settings.language,
+        "duree_totale_s": outcome.total_time_s,
+        "essais_completes": outcome.n_completed,
+        "essais_prevus": outcome.total_trials_planned,
+        "essais_corrects": outcome.n_correct,
+        "precision_pourcent": outcome.accuracy_percent,
+        "seuil_final_moyen_deg": outcome.final_threshold_deg,
+        "seuils_finaux_par_staircase_deg": (
+            [ANGLE_RANGE_DEG[i] for i in outcome.final_stair_idxs] if outcome.final_stair_idxs else []
+        ),
+        "interrompue": outcome.aborted,
+        "erreur": outcome.error,
+        "verification_initiale_perf_echouee": outcome.perf_check_failed,
+        "changement_alimentation_detecte": outcome.power_source_changed,
+        "essais_avec_anomalie_timing": sum(r.timing_anomaly for r in outcome.trials),
+        "statistiques_temps_reponse": compute_rt_statistics(outcome.trials),
+        "position": {
+            "axe_reponse": settings.axis_mode,
+            "fixation_h_deg": settings.fixation_h_deg,
+            "fixation_v_deg": settings.fixation_v_deg,
+            "stimulus_h_deg": settings.stim_h_deg,
+            "stimulus_v_deg": settings.stim_v_deg,
+        },
+        "protocole": {
+            "n_staircases": N_STAIRCASES,
+            "echelle_angles_deg": ANGLE_RANGE_DEG,
+            "densite_points_par_deg2": DOT_DENSITY_PER_DEG2,
+            "vitesse_points_deg_s": DOT_SPEED_DEG_PER_S,
+            "rayon_aperture_deg": APERTURE_RADIUS_DEG,
+            "duree_stimulus_ms": STIMULUS_DURATION_MS,
+            "duree_vie_points_ms": DOT_LIFETIME_MS,
+            "duree_precue_s": CUE_DURATION_S,
+            "isi_post_precue_s": POST_CUE_ISI_S,
+            "precue_activee": settings.show_precue,
+            "style_precue": "chevron_deux_segments",
+            "mode_correspondance_touche": "deduite_geometriquement_du_vecteur_affiche",
+        },
+        "ecran": {
+            "index": profile.screen_index,
+            "resolution_px": [profile.width_px, profile.height_px],
+            "diagonale_pouces": profile.diagonal_in,
+            "largeur_cm": profile.width_cm,
+            "distance_visionnage_cm": profile.viewing_distance_cm,
+            "px_par_degre": profile.px_per_deg,
+            "taille_point_px": profile.dot_size_px,
+            "frequence_rafraichissement_mesuree_hz": outcome.frame_rate_measured,
+        },
+        "verification_physique": outcome.calibration_check,
+        "pauses_programmees": settings.pause_mode,
+        "fichier_essais_csv": os.path.basename(csv_path),
+    }
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+
+    return csv_path, json_path
+
+
+def write_session_outputs(settings: "SessionSettings", profile: "ScreenProfile", outcome: SessionOutcome,
+                           session_num: int, timestamp: _dt.datetime,
+                           logger: logging.Logger) -> Tuple[Optional[str], Optional[str], str]:
+    """Enregistre les resultats de la seance (CSV essai-par-essai + resume
+    JSON). AJOUT PAR RAPPORT AU PYTHON PRECEDENT (27/08, code E12) : la version
+    precedente appelait l'ecriture des fichiers sans aucune gestion
+    d'exception -- une erreur disque (espace insuffisant, droits refuses)
+    SURVENANT APRES UNE SEANCE COMPLETE faisait perdre definitivement les
+    resultats, sans le moindre message a l'ecran. Ici, un premier echec
+    bascule automatiquement vers un repertoire de secours (dossier temporaire
+    du systeme) ; si ce secours echoue aussi, l'appelant (main) doit en
+    informer le patient/l'aidant. Retourne (csv_path, json_path, statut) avec
+    statut in {'ok', 'secours', 'echec'} -- csv_path/json_path valent None
+    uniquement si statut == 'echec'."""
+    primary_dir = os.path.join(BASE_DIR, DATA_DIRNAME)
+    try:
+        csv_path, json_path = _write_session_outputs_to_dir(primary_dir, settings, profile, outcome, session_num, timestamp)
+        logger.info("Resultats enregistres : %s / %s", csv_path, json_path)
+        return csv_path, json_path, "ok"
+    except Exception as exc:
+        logger.error("[%s] Echec de sauvegarde des resultats dans %s : %s", ERR_CODE_SAVE_FAILURE, primary_dir, exc)
+
+    fallback_dir = os.path.join(tempfile.gettempdir(), DATA_DIRNAME)
+    try:
+        csv_path, json_path = _write_session_outputs_to_dir(fallback_dir, settings, profile, outcome, session_num, timestamp)
+        logger.warning("[%s] Sauvegarde de secours reussie : %s / %s", ERR_CODE_SAVE_FAILURE, csv_path, json_path)
+        return csv_path, json_path, "secours"
+    except Exception as exc:
+        logger.error("[%s] Echec de la sauvegarde de secours egalement : %s", ERR_CODE_SAVE_FAILURE, exc)
+        return None, None, "echec"
+
+
+def run_calibration_check_screen(win: "visual.Window", profile: "ScreenProfile", settings: "SessionSettings",
+                                  calib: Dict[str, float], lang: str) -> str:
+    """Reproduit l'ecran de verification physique de HuxlinLabFBAtraining.m
+    (lignes 337-361 : test_rect2/test_size/test_size2) -- dessine, a
+    l'echelle reelle, un carre blanc (diametre = ouverture de l'aperture RDK,
+    a la position du stimulus) et un trait entre la croix de fixation et ce
+    carre, avec leur taille annoncee pour verification a la regle. MATLAB
+    n'annonce que des pouces ; le cm est ajoute ici (affichage uniquement,
+    aucune valeur scientifique n'en depend) car le public est francophone.
+
+    AJOUT PAR RAPPORT A MATLAB (demande explicitement le 27/08) : MATLAB
+    affiche ces mesures puis attend une touche QUELCONQUE pour continuer,
+    sans jamais demander confirmation ni offrir de correction -- purement
+    informatif, sans porte de sortie. Ici, une confirmation explicite est
+    demandee : ESPACE = correspond, on continue (comme partout ailleurs dans
+    ce script) ; RETOUR ARRIERE = ne correspond pas, on retourne CORRIGER LA
+    CALIBRATION -- en rouvrant EXACTEMENT le meme formulaire que
+    run_setup_wizard (_ask_full_settings), jamais un second point de saisie
+    independant ; ECHAP = quitter la seance (comme partout ailleurs).
+    Retourne 'confirmed', 'correct', ou 'quit'."""
+    ppd = profile.px_per_deg
+    fix_pos_px = (deg2px(settings.fixation_h_deg, ppd), deg2px(settings.fixation_v_deg, ppd))
+    stim_pos_px = (deg2px(settings.stim_h_deg, ppd), deg2px(settings.stim_v_deg, ppd))
+    box_side_px = 2.0 * deg2px(APERTURE_RADIUS_DEG, ppd)
+
+    box = visual.Rect(
+        win, size=(box_side_px, box_side_px), pos=stim_pos_px,
+        fillColor=1.0, lineColor=None, colorSpace="rgb", units="pix",
+    )
+    line = visual.Line(
+        win, start=fix_pos_px, end=stim_pos_px, lineColor=TEXT_COLOR_RGB, lineWidth=2, units="pix",
+    )
+    fixation_outer = visual.Circle(
+        win, radius=deg2px(FIX_OUTER_RADIUS_DEG, ppd), fillColor=FIX_OUTER_COLOR_RGB,
+        lineColor=FIX_OUTER_COLOR_RGB, pos=fix_pos_px, units="pix",
+    )
+    fixation_inner = visual.Circle(
+        win, radius=deg2px(FIX_INNER_RADIUS_DEG, ppd), fillColor=FIX_INNER_COLOR_RGB,
+        lineColor=FIX_INNER_COLOR_RGB, pos=fix_pos_px, units="pix",
+    )
+    # Bloc de texte ancre en HAUT d'ecran a position fixe -- comme les
+    # `Screen('DrawText', w, ..., 100, 130..250, 0)` de MATLAB, qui placent
+    # deliberement ce texte dans une zone fixe independante de la geometrie
+    # (variable) fixation/stimulus, pour ne jamais se superposer au carre/trait.
+    label = visual.TextStim(
+        win, text=t("calib_check_body", lang, box_cm=calib["box_cm"], box_in=calib["box_in"],
+                     line_cm=calib["line_cm"], line_in=calib["line_in"]),
+        color=TEXT_COLOR_RGB, height=22, wrapWidth=profile.width_px * 0.8, units="pix",
+        pos=(0, profile.height_px / 2.0 - 40), anchorHoriz="center", anchorVert="top", alignText="center",
+    )
+
+    box.draw()
+    line.draw()
+    fixation_outer.draw()
+    fixation_inner.draw()
+    label.draw()
+    win.flip()
+    keys = event.waitKeys(keyList=["space", "backspace", "escape"])
+    key = keys[0] if keys else "escape"
+    if key == "space":
+        return "confirmed"
+    if key == "backspace":
+        return "correct"
+    return "quit"
+
+
+def build_readme_stims(win: "visual.Window", wrap_width_px: float, intro_text: str,
+                        disclaimer_text: str, details_text: str) -> List["visual.TextStim"]:
+    """Construit les 3 blocs de texte empiles de l'ecran pre-lancement (intro
+    neutre / disclaimer sante EN ROUGE -- demande explicitement le 27/08 /
+    details de la seance), en mesurant la hauteur REELLE de chaque bloc via
+    TextStim.boundingBox -- propriete officiellement documentee comme
+    toujours exprimee en pixels quelles que soient les unites du stim (voir
+    docs.psychopy.org/api/visual/textstim.html) -- plutot que de supposer une
+    hauteur de ligne fixe (fragile : depend de la police, du nombre de lignes
+    apres retour a la ligne automatique, etc.). Les 3 blocs restent centres
+    horizontalement (anchorHoriz='center', comme l'unique bloc precedent) et
+    sont ancres par leur bord SUPERIEUR (anchorVert='top') pour permettre
+    l'empilement ; le groupe entier est ensuite recentre verticalement autour
+    de y=0 pour reproduire la position centrale du bloc unique d'origine."""
+    blocks = [
+        (intro_text, TEXT_COLOR_RGB),
+        (disclaimer_text, DISCLAIMER_COLOR_RGB),
+        (details_text, TEXT_COLOR_RGB),
+    ]
+    stims: List["visual.TextStim"] = []
+    heights: List[float] = []
+    for text, color in blocks:
+        stim = visual.TextStim(
+            win, text=text, color=color, height=22, wrapWidth=wrap_width_px, units="pix",
+            pos=(0, 0), anchorHoriz="center", anchorVert="top", alignText="center",
+        )
+        stims.append(stim)
+        heights.append(float(stim.boundingBox[1]))
+
+    total_height = sum(heights) + README_BLOCK_GAP_PX * (len(stims) - 1)
+    y = total_height / 2.0
+    for stim, h in zip(stims, heights):
+        stim.pos = (0, y)
+        y -= (h + README_BLOCK_GAP_PX)
+    return stims
+
+# -----------------------------------------------------------------------------
+# Point d'entree principal
+# -----------------------------------------------------------------------------
+
+def main() -> Optional[SessionOutcome]:
+    try:
+        run_startup_self_tests()
+    except Exception as exc:
+        # AJOUT PAR RAPPORT AU PYTHON PRECEDENT (27/08, code E99) : ce popup
+        # utilisait auparavant un texte bilingue code en dur, hors du systeme
+        # TR/t() -- normal, puisqu'il se declenche AVANT tout appel a
+        # _ask_language_if_unknown() dans le flux de controle. On recupere ici
+        # la langue eventuellement deja memorisee (load_app_language) pour
+        # afficher un message correctement localise ; a defaut, on retombe sur
+        # le francais (public principal de l'outil) plutot que sur un texte
+        # bilingue approximatif.
+        try:
+            fallback_lang = load_app_language() or "fr"
+        except Exception:
+            fallback_lang = "fr"
+        try:
+            err = gui.Dlg(title=f'{t("err_startup_selftest_title", fallback_lang)} [{ERR_CODE_STARTUP_SELFTEST}]')
+            err.addText(t("err_startup_selftest_msg", fallback_lang, detail=exc))
+            err.show()
+        except Exception:
+            print("ERREUR CRITIQUE (auto-test de demarrage) :", exc, file=sys.stderr)
+            traceback.print_exc()
+        return None
+
+    bootstrap_logger = logging.getLogger(SOFTWARE_NAME)
+    wizard = run_setup_wizard(bootstrap_logger)
+    if wizard is None:
+        return None
+    settings, profile = wizard
+
+    timestamp = _dt.datetime.now()
+    session_num = next_session_number(settings.subject_id, bootstrap_logger)
+    logger = setup_logging(settings.subject_id, session_num, timestamp)
+    logger.info("Auto-tests de demarrage : OK.")
+    logger.info("Reglages retenus : %s", json.dumps(settings.to_dict(), ensure_ascii=False))
+    logger.info(
+        "Profil ecran : index=%d resolution=%dx%d diagonale=%.1fpo largeur=%.1fcm distance=%.1fcm "
+        "px_par_deg=%.2f taille_point=%.1fpx",
+        profile.screen_index, profile.width_px, profile.height_px, profile.diagonal_in,
+        profile.width_cm, profile.viewing_distance_cm, profile.px_per_deg, profile.dot_size_px,
+    )
+
+    lang = settings.language
+
+    # ---------------------------------------------------------------------
+    # Ouverture fenetre + verification physique de la calibration (boucle) :
+    # reproduit l'ecran test_rect2/test_size/test_size2 de MATLAB (voir
+    # run_calibration_check_screen). MATLAB, lui, la MONTRE A CHAQUE SEANCE
+    # sans exception, sans le moindre raccourci pour la sauter. CORRECTIF
+    # (27/08, round 3) : ce commentaire affirmait auparavant, a tort, le meme
+    # comportement pour cette version Python -- il decrivait un etat perime
+    # depuis la tache #43 (verification calibration : une seule fois, pas a
+    # chaque seance). Le comportement REEL, inchange depuis, est : une seule
+    # fois par profil ecran exact (resolution + diagonale/largeur/distance
+    # saisies), voir SessionSettings.calibration_verified et le garde-fou
+    # `if settings.calibration_verified: ... break` juste plus bas dans cette
+    # meme boucle -- et son pendant dans run_setup_wizard (ligne ~2622) qui
+    # decide si ce flag est reconduit d'une seance a l'autre. Si l'utilisateur
+    # indique que les mesures ne correspondent pas, on ferme la fenetre et on
+    # rouvre EXACTEMENT le meme formulaire de calibration que
+    # run_setup_wizard (_ask_full_settings) -- jamais un second point de
+    # saisie -- puis on reessaie avec le nouveau profil.
+    # ---------------------------------------------------------------------
+    while True:
+        mon = monitors.Monitor(f"fba_tiltglobal_{settings.subject_id}")
+        mon.setWidth(profile.width_cm)
+        mon.setDistance(profile.viewing_distance_cm)
+        mon.setSizePix([profile.width_px, profile.height_px])
+
+        try:
+            win = visual.Window(
+                size=(profile.width_px, profile.height_px), fullscr=True, screen=profile.screen_index,
+                monitor=mon, units="pix", color=BACKGROUND_RGB, colorSpace="rgb", allowGUI=False,
+            )
+        except Exception as exc:
+            # AJOUT PAR RAPPORT AU PYTHON PRECEDENT (27/08, code E98) : cet
+            # echec etait auparavant journalise (logger.error) mais sans
+            # AUCUN message a l'ecran pour le patient/aidant -- puisqu'aucune
+            # fenetre PsychoPy n'existe encore a ce stade, un TextStim est
+            # impossible ; on utilise gui.Dlg, comme pour E99.
+            logger.error("[%s] Impossible d'ouvrir la fenetre PsychoPy : %s", ERR_CODE_WINDOW_OPEN, exc)
+            log_uncaught_exception(logger, exc)
+            try:
+                err = gui.Dlg(title=f'{t("err_window_title", lang)} [{ERR_CODE_WINDOW_OPEN}]')
+                err.addText(t("err_window_msg", lang))
+                err.show()
+            except Exception:
+                print("ERREUR CRITIQUE (ouverture fenetre) :", exc, file=sys.stderr)
+            return None
+
+        calib = compute_calibration_check(profile, settings)
+
+        if settings.calibration_verified:
+            # Deja verifiee au metre pour ce profil exact (voir run_setup_wizard) --
+            # demande explicitement le 27/08 de ne PAS la redemander a chaque seance.
+            logger.info("Verification physique de calibration sautee (deja confirmee pour ce profil ecran).")
+            break
+
+        calib_result = run_calibration_check_screen(win, profile, settings, calib, lang)
+
+        if calib_result == "confirmed":
+            settings.calibration_verified = True
+            settings.calib_verified_width_px = profile.width_px
+            settings.calib_verified_height_px = profile.height_px
+            settings.calib_verified_diagonal_in = profile.diagonal_in
+            settings.calib_verified_width_cm = profile.width_cm
+            settings.calib_verified_distance_cm = profile.viewing_distance_cm
+            save_settings(settings, logger)
+            break
+
+        win.close()
+        if calib_result == "quit":
+            logger.info("Seance annulee par l'utilisateur a l'ecran de verification physique.")
+            return None
+
+        logger.info("Calibration jugee incorrecte par l'utilisateur -- retour au formulaire de calibration.")
+        edited = _ask_full_settings(lang, settings)
+        if edited is None:
+            logger.info("Correction de calibration annulee par l'utilisateur.")
+            return None
+        settings, profile = edited
+        save_settings(settings, logger)
+        logger.info("Reglages corriges : %s", json.dumps(settings.to_dict(), ensure_ascii=False))
+        logger.info(
+            "Profil ecran corrige : index=%d resolution=%dx%d diagonale=%.1fpo largeur=%.1fcm "
+            "distance=%.1fcm px_par_deg=%.2f taille_point=%.1fpx",
+            profile.screen_index, profile.width_px, profile.height_px, profile.diagonal_in,
+            profile.width_cm, profile.viewing_distance_cm, profile.px_per_deg, profile.dot_size_px,
+        )
+
+    axis_instruction = t("instr_vertical", lang) if settings.axis_mode == "vertical" else t("instr_horizontal", lang)
+    _, actual_total = compute_actual_trial_counts(settings.n_trials)
+    readme_intro_text = t("readme_body_intro", lang)
+    readme_disclaimer_text = t("readme_disclaimer", lang)
+    readme_details_text = t(
+        "readme_body_details", lang,
+        h=settings.stim_h_deg, v=settings.stim_v_deg,
+        fix_h=settings.fixation_h_deg, fix_v=settings.fixation_v_deg,
+        dist=settings.viewing_distance_cm,
+        diag=settings.screen_diagonal_in, ntrials=actual_total,
+        precue=(t("yes", lang) if settings.show_precue else t("no", lang)),
+        box_cm=calib["box_cm"], box_in=calib["box_in"], line_cm=calib["line_cm"], line_in=calib["line_in"],
+        axis_instruction=axis_instruction,
+    )
+    readme_stims = build_readme_stims(
+        win, profile.width_px * 0.7, readme_intro_text, readme_disclaimer_text, readme_details_text,
+    )
+    for stim in readme_stims:
+        stim.draw()
+    win.flip()
+    keys = event.waitKeys(keyList=["space", "escape"])
+    if keys and keys[0] == "escape":
+        logger.info("Seance annulee par l'utilisateur a l'ecran d'instructions.")
+        win.close()
+        return None
+
+    outcome = run_session(win, profile, settings, logger)
+
+    if outcome.perf_check_failed:
+        # AJOUT PAR RAPPORT A MATLAB (27/08, code E10) : aucun essai reel n'a
+        # ete execute (echec bloquant de la verification initiale de
+        # performance) -- rien a enregistrer, on l'affiche directement.
+        # Design confirme par l'utilisateur : bloquant, pas de tentative de
+        # sauvegarde d'une seance qui n'a jamais reellement commence.
+        title = f'{t("err_perf_check_title", lang)} [{ERR_CODE_PERF_CHECK}]'
+        body = t("err_perf_check_msg", lang) + "\n\n" + t("end_press_key", lang)
+        end_text = visual.TextStim(win, text=title + "\n\n" + body, color=TEXT_COLOR_RGB, height=24,
+                                    wrapWidth=profile.width_px * 0.7, units="pix")
+        end_text.draw()
+        win.flip()
+        event.waitKeys()
+        win.close()
+        logger.info("Fin de seance : verification initiale de performance echouee, seance non demarree.")
+        return outcome
+
+    csv_path, json_path, save_status = write_session_outputs(settings, profile, outcome, session_num, timestamp, logger)
+
+    if outcome.error:
+        title = t("end_error_title", lang)
+        body = t("end_trials", lang, done=outcome.n_completed, total=outcome.total_trials_planned)
+    elif outcome.aborted:
+        title = t("end_aborted_title", lang)
+        body = (
+            t("end_trials", lang, done=outcome.n_completed, total=outcome.total_trials_planned) + "\n"
+            + t("end_accuracy", lang, acc=outcome.accuracy_percent) + "\n"
+            + t("escape_quit_saved", lang)
+        )
+    else:
+        title = t("end_complete_title", lang)
+        body = (
+            t("end_accuracy", lang, acc=outcome.accuracy_percent) + "\n"
+            + t("end_final_level", lang, lvl=outcome.final_threshold_deg) + "\n"
+            + t("end_trials", lang, done=outcome.n_completed, total=outcome.total_trials_planned) + "\n\n"
+            + t("end_note_fit", lang)
+        )
+
+    # AJOUTS PAR RAPPORT A MATLAB (27/08, codes E11/E12) : notes informatives
+    # non bloquantes ajoutees a l'ecran de fin de seance, en plus du
+    # journal -- le patient/aidant doit pouvoir les constater sans avoir a
+    # consulter les logs.
+    if save_status == "secours":
+        body += "\n\n" + f'{t("err_save_failed_note", lang)} [{ERR_CODE_SAVE_FAILURE}]'
+    elif save_status == "echec":
+        body += "\n\n" + f'{t("err_save_failed_total_note", lang)} [{ERR_CODE_SAVE_FAILURE}]'
+    if outcome.power_source_changed:
+        body += "\n\n" + f'{t("warn_power_change_note", lang)} [{ERR_CODE_POWER_SOURCE}]'
+
+    body += "\n\n" + t("end_press_key", lang)
+
+    end_text = visual.TextStim(win, text=title + "\n\n" + body, color=TEXT_COLOR_RGB, height=24,
+                                wrapWidth=profile.width_px * 0.7, units="pix")
+    end_text.draw()
+    win.flip()
+    event.waitKeys()
+    win.close()
+
+    logger.info(
+        "Fin de seance : essais=%d/%d corrects=%d precision=%.1f%% seuil_final=%.2fdeg interrompue=%s erreur=%s",
+        outcome.n_completed, outcome.total_trials_planned, outcome.n_correct, outcome.accuracy_percent,
+        outcome.final_threshold_deg, outcome.aborted, outcome.error,
+    )
+    return outcome
+
+
+if __name__ == "__main__":
+    main()
